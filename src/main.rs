@@ -12,12 +12,12 @@ use windows::{
 
 fn main() -> Result<()> {
     unsafe {
-        let instance = GetModuleHandleA(None)?;
-        debug_assert!(instance.0 != 0);
+        let module_handle = GetModuleHandleA(None)?;
+        debug_assert!(module_handle.0 != 0);
 
         let wc = WNDCLASSA {
             hCursor: LoadCursorW(None, IDC_ARROW)?,
-            hInstance: instance,
+            hInstance: HINSTANCE::from(module_handle),
             lpszClassName: s!("HandmadeHeroWindowClass"),
 
             style: CS_HREDRAW | CS_VREDRAW | CS_OWNDC,
@@ -39,7 +39,7 @@ fn main() -> Result<()> {
             CW_USEDEFAULT,
             None,
             None,
-            instance,
+            module_handle,
             None,
         );
 
@@ -83,13 +83,13 @@ extern "system" fn wndproc(window: HWND, message: u32, wparam: WPARAM, lparam: L
                 let y = paint.rcPaint.top;
                 static mut ROP: ROP_CODE = WHITENESS;
 
-                PatBlt(hdc, x, y, width, height, ROP);
+                let _ = PatBlt(hdc, x, y, width, height, ROP);
                 if ROP == WHITENESS {
                     ROP = BLACKNESS;
                 } else {
                     ROP = WHITENESS;
                 }
-                EndPaint(window, &mut paint);
+                let _ = EndPaint(window, &paint);
                 LRESULT(0)
             }
             _ => DefWindowProcA(window, message, wparam, lparam),
