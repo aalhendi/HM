@@ -8,9 +8,7 @@ edition = "2021"
 [dependencies]
 
 [dependencies.windows]
-version = "0.56.0"
-git = "https://github.com/microsoft/windows-rs/"
-rev = "ae896c59e4d05895cb17d3b2c3c7c56ccac47207"
+version = "0.58"
 
 features = [
     "Data_Xml_Dom",

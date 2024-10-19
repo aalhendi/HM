@@ -163,13 +163,14 @@ fn main() -> Result<()> {
             None,
             module_handle,
             None,
-        );
+        )
+        .unwrap(); // TODO(aalhendi): use expect(), remove redundant debug assert.
 
-        if window_handle == HWND(0) {
+        if window_handle.is_invalid() {
             // TODO(aalhendi): Logging
             // return
         }
-        debug_assert!(window_handle != HWND(0));
+        debug_assert!(!window_handle.is_invalid());
 
         GLOBAL_RUNNING = true;
         let mut x_offset = 0;
