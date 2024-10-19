@@ -13,6 +13,7 @@ use windows::{
     },
 };
 
+const BYTES_PER_PIXEL: i32 = 4;
 // TODO(aalhendi): This is a global for now.
 static mut GLOBAL_RUNNING: bool = false;
 static mut GLOBAL_BACKBUFFER: Win32OffscreenBuffer = Win32OffscreenBuffer {
@@ -20,7 +21,6 @@ static mut GLOBAL_BACKBUFFER: Win32OffscreenBuffer = Win32OffscreenBuffer {
     memory: ptr::null_mut(),
     width: 0,
     height: 0,
-    bytes_per_pixel: 4,
     pitch: 0,
 };
 
@@ -44,6 +44,7 @@ impl From<HWND> for Win32WindowDimension {
     }
 }
 struct Win32OffscreenBuffer {
+    // NOTE(aalhendi): pixels are always 32-bits wide, Memory Order BB GG RR XX
     info: BITMAPINFO,
     // NOTE(aalhendi): void* to avoid specifying the type, we want windows to give us back a ptr to the bitmap memory
     //  windows doesn't know (on the API lvl), what sort of flags, and therefore what kind of memory we want.
@@ -52,7 +53,6 @@ struct Win32OffscreenBuffer {
     memory: *mut std::ffi::c_void,
     width: i32,
     height: i32,
-    bytes_per_pixel: i32,
     pitch: isize,
 }
 
@@ -80,19 +80,11 @@ impl Win32OffscreenBuffer {
         }
     }
 
-    unsafe fn win32_copy_buffer_to_window(
-        &self,
-        device_context: HDC,
-        _x: i32,
-        _y: i32,
-        width: i32,
-        height: i32,
-    ) {
+    unsafe fn win32_copy_buffer_to_window(&self, device_context: HDC, width: i32, height: i32) {
         // TODO(aalhendi): aspect ratio correction
+        // TODO(aalhendi): play with stretch modes
         StretchDIBits(
             device_context,
-            // x,y,width,height,
-            // x,y,width,height,
             0,
             0,
             width,
@@ -128,10 +120,10 @@ impl Win32OffscreenBuffer {
         self.info.bmiHeader.biBitCount = 32; // 8 for red, 8 for green, 8 for blue, ask for 32 for DWORD alignment
         self.info.bmiHeader.biCompression = BI_RGB.0; // Uncompressed
 
-        let bitmap_memory_size = (self.bytes_per_pixel * self.width * self.height) as usize;
+        let bitmap_memory_size = (BYTES_PER_PIXEL * self.width * self.height) as usize;
         self.memory = VirtualAlloc(None, bitmap_memory_size, MEM_COMMIT, PAGE_READWRITE);
 
-        self.pitch = (width * self.bytes_per_pixel) as isize;
+        self.pitch = (width * BYTES_PER_PIXEL) as isize;
         // TODO(aalhendi): Probably clear this to black
     }
 }
@@ -196,13 +188,7 @@ fn main() -> Result<()> {
 
             let device_context = GetDC(window_handle);
             let dims = Win32WindowDimension::from(window_handle);
-            GLOBAL_BACKBUFFER.win32_copy_buffer_to_window(
-                device_context,
-                0,
-                0,
-                dims.width,
-                dims.height,
-            );
+            GLOBAL_BACKBUFFER.win32_copy_buffer_to_window(device_context, dims.width, dims.height);
             ReleaseDC(window_handle, device_context);
             x_offset += 1;
             y_offset += 2;
@@ -221,7 +207,6 @@ extern "system" fn win32_main_window_callback(
     unsafe {
         // Update the buffer in size, blip the buffer on paint
         match message {
-            WM_SIZE => LRESULT(0),
             WM_CLOSE => {
                 // TODO(aalhendi): Handle this with a message to the user?
                 GLOBAL_RUNNING = false;
@@ -239,13 +224,9 @@ extern "system" fn win32_main_window_callback(
             WM_PAINT => {
                 let mut paint = PAINTSTRUCT::default();
                 let device_context = BeginPaint(window, &mut paint);
-                let x = paint.rcPaint.left;
-                let y = paint.rcPaint.top;
                 let dims = Win32WindowDimension::from(window);
                 GLOBAL_BACKBUFFER.win32_copy_buffer_to_window(
                     device_context,
-                    x,
-                    y,
                     dims.width,
                     dims.height,
                 );
