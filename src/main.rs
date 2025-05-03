@@ -10,7 +10,23 @@ use windows::{
             LibraryLoader::GetModuleHandleA,
             Memory::{MEM_COMMIT, MEM_RELEASE, PAGE_READWRITE, VirtualAlloc, VirtualFree},
         },
-        UI::WindowsAndMessaging::*,
+        UI::{
+            Input::{
+                KeyboardAndMouse::{
+                    VIRTUAL_KEY, VK_A, VK_D, VK_DOWN, VK_E, VK_ESCAPE, VK_LEFT, VK_Q, VK_RIGHT,
+                    VK_S, VK_SPACE, VK_UP, VK_W,
+                },
+                XboxController::{
+                    XINPUT_GAMEPAD_A, XINPUT_GAMEPAD_B, XINPUT_GAMEPAD_BACK,
+                    XINPUT_GAMEPAD_DPAD_DOWN, XINPUT_GAMEPAD_DPAD_LEFT, XINPUT_GAMEPAD_DPAD_RIGHT,
+                    XINPUT_GAMEPAD_DPAD_UP, XINPUT_GAMEPAD_LEFT_SHOULDER,
+                    XINPUT_GAMEPAD_LEFT_THUMB, XINPUT_GAMEPAD_RIGHT_SHOULDER,
+                    XINPUT_GAMEPAD_RIGHT_THUMB, XINPUT_GAMEPAD_START, XINPUT_GAMEPAD_X,
+                    XINPUT_GAMEPAD_Y, XINPUT_STATE, XInputGetState, XUSER_MAX_COUNT,
+                },
+            },
+            WindowsAndMessaging::*,
+        },
     },
     core::*,
 };
@@ -60,21 +76,21 @@ struct Win32OffscreenBuffer {
 }
 
 impl Win32OffscreenBuffer {
-    unsafe fn render_weird_gradient(&self, blue_offset: u32, green_offset: u32) {
-        let width = self.width as u32;
-        let height = self.height as u32;
+    unsafe fn render_weird_gradient(&self, blue_offset: i32, green_offset: i32) {
+        let width = self.width;
+        let height = self.height;
 
         let mut row = self.memory as *const u8;
         for y in 0..height {
-            let mut pixel = row as *mut u32;
+            let mut pixel = row as *mut i32;
             for x in 0..width {
                 /*
                 Padding is not put first even if its Little Endian because... Windows.
                 Memory (u32): BB GG RR XX
                 Register: XX RR GG BB where XX is padding 0
                 */
-                let blue = x + blue_offset;
-                let green = y + green_offset;
+                let blue = x.wrapping_add(blue_offset);
+                let green = y.wrapping_add(green_offset);
 
                 unsafe {
                     *pixel = (green << 8) | blue;
@@ -194,12 +210,60 @@ fn main() -> Result<()> {
                 DispatchMessageA(&message);
                 let _ = TranslateMessage(&message); // TODO(aalhendi): handle zero case?
             }
+
+            // TODO(aalhendi): should we poll this more frequently?
+            for controller_index in 0..XUSER_MAX_COUNT {
+                let mut controller_state: XINPUT_STATE = XINPUT_STATE::default();
+                let x_input_state_res = XInputGetState(controller_index, &mut controller_state);
+                if x_input_state_res == ERROR_SUCCESS.0 {
+                    // NOTE(aalhendi): This controller is connected
+                    // TODO(aalhendi): see if controller_state.dwPacketNumber increments too rapidly
+                    let pad = &controller_state.Gamepad;
+
+                    let _up = pad.wButtons & XINPUT_GAMEPAD_DPAD_UP;
+                    let _down = pad.wButtons & XINPUT_GAMEPAD_DPAD_DOWN;
+                    let _left = pad.wButtons & XINPUT_GAMEPAD_DPAD_LEFT;
+                    let _right = pad.wButtons & XINPUT_GAMEPAD_DPAD_RIGHT;
+                    let _start = pad.wButtons & XINPUT_GAMEPAD_START;
+                    let _back = pad.wButtons & XINPUT_GAMEPAD_BACK;
+                    let _left_thumb = pad.wButtons & XINPUT_GAMEPAD_LEFT_THUMB;
+                    let _right_thumb = pad.wButtons & XINPUT_GAMEPAD_RIGHT_THUMB;
+                    let _left_shoulder = pad.wButtons & XINPUT_GAMEPAD_LEFT_SHOULDER;
+                    let _right_shoulder = pad.wButtons & XINPUT_GAMEPAD_RIGHT_SHOULDER;
+                    let a_button = pad.wButtons & XINPUT_GAMEPAD_A;
+                    let _b_button = pad.wButtons & XINPUT_GAMEPAD_B;
+                    let _x_button = pad.wButtons & XINPUT_GAMEPAD_X;
+                    let _y_button = pad.wButtons & XINPUT_GAMEPAD_Y;
+
+                    let stick_left_x = pad.sThumbLX;
+                    let stick_left_y = pad.sThumbLY;
+                    let _stick_right_x = pad.sThumbRX;
+                    let _stick_right_y = pad.sThumbRY;
+
+                    x_offset += (stick_left_x as i32) >> 12;
+                    y_offset += (stick_left_y as i32) >> 12;
+
+                    if a_button.0 != 0 {
+                        y_offset += 2;
+                    }
+                } else {
+                    // NOTE(aalhendi): This controller is not available
+                }
+            }
+
+            // Test out vibration
+            windows::Win32::UI::Input::XboxController::XInputSetState(
+                0,
+                &windows::Win32::UI::Input::XboxController::XINPUT_VIBRATION {
+                    wLeftMotorSpeed: 65535,
+                    wRightMotorSpeed: 65535,
+                },
+            );
+
             GLOBAL_BACKBUFFER.render_weird_gradient(x_offset, y_offset);
 
             let dims = Win32WindowDimension::from(window_handle);
             GLOBAL_BACKBUFFER.win32_copy_buffer_to_window(device_context, dims.width, dims.height);
-            x_offset += 1;
-            y_offset += 2;
         }
 
         Ok(())
@@ -225,6 +289,30 @@ extern "system" fn win32_main_window_callback(
                 GLOBAL_RUNNING = false;
                 LRESULT(0)
             }
+            WM_KEYDOWN | WM_KEYUP | WM_SYSKEYDOWN | WM_SYSKEYUP => {
+                let virtual_key_code = wparam;
+                let was_down = (lparam.0 & (1 << 30)) != 0;
+                let is_down = (lparam.0 & (1 << 31)) == 0;
+                if was_down != is_down {
+                    match VIRTUAL_KEY(virtual_key_code.0 as u16) {
+                        VK_W => println!("W key pressed"),
+                        VK_S => println!("S key pressed"),
+                        VK_A => println!("A key pressed"),
+                        VK_D => println!("D key pressed"),
+                        VK_Q => println!("Q key pressed"),
+                        VK_E => println!("E key pressed"),
+                        VK_UP => println!("Up key pressed"),
+                        VK_DOWN => println!("Down key pressed"),
+                        VK_LEFT => println!("Left key pressed"),
+                        VK_RIGHT => println!("Right key pressed"),
+                        VK_ESCAPE => println!("Escape key pressed"),
+                        VK_SPACE => println!("Space key pressed"),
+                        _ => {}
+                    }
+                }
+                LRESULT(0)
+            }
+
             WM_ACTIVATEAPP => {
                 println!("WM_ACTIVATE");
                 LRESULT(0)
