@@ -1,16 +1,18 @@
+#![allow(static_mut_refs)]
+
 use std::{mem::size_of, ptr};
 
 use windows::{
-    core::*,
     Win32::{
         Foundation::*,
         Graphics::Gdi::*,
         System::{
             LibraryLoader::GetModuleHandleA,
-            Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, PAGE_READWRITE},
+            Memory::{MEM_COMMIT, MEM_RELEASE, PAGE_READWRITE, VirtualAlloc, VirtualFree},
         },
         UI::WindowsAndMessaging::*,
     },
+    core::*,
 };
 
 const BYTES_PER_PIXEL: i32 = 4;
@@ -51,6 +53,7 @@ struct Win32OffscreenBuffer {
     //  CreateDIBSection also can't haveThe fn can only have one signature, it cant get a u8ptr OR a u64 ptr etc. so we pass a void* and cast appropriately
     //  it is used as a double ptr because we give windows an addr of a ptr which we want it to OVERWRITE into a NEW PTR which would point to where it alloc'd mem
     memory: *mut std::ffi::c_void,
+    // NOTE(aalhendi): We store width and height in self.info.bmiHeader. This is redundant. Keeping because its only 8 bytes
     width: i32,
     height: i32,
     pitch: isize,
@@ -73,37 +76,41 @@ impl Win32OffscreenBuffer {
                 let blue = x + blue_offset;
                 let green = y + green_offset;
 
-                *pixel = (green << 8) | blue;
-                pixel = pixel.offset(1);
+                unsafe {
+                    *pixel = (green << 8) | blue;
+                    pixel = pixel.offset(1);
+                }
             }
-            row = row.offset(self.pitch);
+            row = unsafe { row.offset(self.pitch) };
         }
     }
 
     unsafe fn win32_copy_buffer_to_window(&self, device_context: HDC, width: i32, height: i32) {
         // TODO(aalhendi): aspect ratio correction
         // TODO(aalhendi): play with stretch modes
-        StretchDIBits(
-            device_context,
-            0,
-            0,
-            width,
-            height,
-            0,
-            0,
-            self.width,
-            self.height,
-            Some(self.memory),
-            &self.info,
-            DIB_RGB_COLORS,
-            SRCCOPY,
-        );
+        unsafe {
+            StretchDIBits(
+                device_context,
+                0,
+                0,
+                width,
+                height,
+                0,
+                0,
+                self.width,
+                self.height,
+                Some(self.memory),
+                &self.info,
+                DIB_RGB_COLORS,
+                SRCCOPY,
+            )
+        };
     }
 
     /// Resize or Initialize a Device Independent Bitmap (DIB)
     unsafe fn win32_resize_dib_section(&mut self, width: i32, height: i32) {
-        if !self.memory.is_null() {
-            let free_res = VirtualFree(self.memory, 0, MEM_RELEASE);
+        if self.memory != unsafe { core::mem::zeroed() } {
+            let free_res = unsafe { VirtualFree(self.memory, 0, MEM_RELEASE) };
             if let Err(e) = free_res {
                 panic!("{e}");
             }
@@ -121,7 +128,7 @@ impl Win32OffscreenBuffer {
         self.info.bmiHeader.biCompression = BI_RGB.0; // Uncompressed
 
         let bitmap_memory_size = (BYTES_PER_PIXEL * self.width * self.height) as usize;
-        self.memory = VirtualAlloc(None, bitmap_memory_size, MEM_COMMIT, PAGE_READWRITE);
+        self.memory = unsafe { VirtualAlloc(None, bitmap_memory_size, MEM_COMMIT, PAGE_READWRITE) };
 
         self.pitch = (width * BYTES_PER_PIXEL) as isize;
         // TODO(aalhendi): Probably clear this to black
@@ -161,7 +168,7 @@ fn main() -> Result<()> {
             CW_USEDEFAULT,
             None,
             None,
-            module_handle,
+            Some(HINSTANCE::from(module_handle)),
             None,
         )
         .unwrap(); // TODO(aalhendi): use expect(), remove redundant debug assert.
@@ -172,9 +179,11 @@ fn main() -> Result<()> {
         }
         debug_assert!(!window_handle.is_invalid());
 
-        GLOBAL_RUNNING = true;
+        // NOTE(aalhendi): By using CS_OWNDC, can get one device context and keep using it forever since it is not shared.
+        let device_context = GetDC(Some(window_handle));
         let mut x_offset = 0;
         let mut y_offset = 0;
+        GLOBAL_RUNNING = true;
         while GLOBAL_RUNNING {
             let mut message = MSG::default();
             while PeekMessageA(&mut message, None, 0, 0, PM_REMOVE).as_bool() {
@@ -187,10 +196,8 @@ fn main() -> Result<()> {
             }
             GLOBAL_BACKBUFFER.render_weird_gradient(x_offset, y_offset);
 
-            let device_context = GetDC(window_handle);
             let dims = Win32WindowDimension::from(window_handle);
             GLOBAL_BACKBUFFER.win32_copy_buffer_to_window(device_context, dims.width, dims.height);
-            ReleaseDC(window_handle, device_context);
             x_offset += 1;
             y_offset += 2;
         }
