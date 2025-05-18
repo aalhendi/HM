@@ -13,8 +13,8 @@ use windows::{
         UI::{
             Input::{
                 KeyboardAndMouse::{
-                    VIRTUAL_KEY, VK_A, VK_D, VK_DOWN, VK_E, VK_ESCAPE, VK_LEFT, VK_Q, VK_RIGHT,
-                    VK_S, VK_SPACE, VK_UP, VK_W,
+                    VIRTUAL_KEY, VK_A, VK_D, VK_DOWN, VK_E, VK_ESCAPE, VK_F4, VK_LEFT, VK_Q,
+                    VK_RIGHT, VK_S, VK_SPACE, VK_UP, VK_W,
                 },
                 XboxController::{
                     XINPUT_GAMEPAD_A, XINPUT_GAMEPAD_B, XINPUT_GAMEPAD_BACK,
@@ -32,6 +32,10 @@ use windows::{
 };
 
 const BYTES_PER_PIXEL: i32 = 4;
+const KEY_MESSAGE_WAS_DOWN_BIT: i32 = 30;
+const KEY_MESSAGE_IS_DOWN_BIT: i32 = 31;
+const KEY_MESSAGE_IS_ALT_BIT: i32 = 29;
+
 // TODO(aalhendi): This is a global for now.
 static mut GLOBAL_RUNNING: bool = false;
 static mut GLOBAL_BACKBUFFER: Win32OffscreenBuffer = Win32OffscreenBuffer {
@@ -144,7 +148,14 @@ impl Win32OffscreenBuffer {
         self.info.bmiHeader.biCompression = BI_RGB.0; // Uncompressed
 
         let bitmap_memory_size = (BYTES_PER_PIXEL * self.width * self.height) as usize;
-        self.memory = unsafe { VirtualAlloc(None, bitmap_memory_size, MEM_COMMIT, PAGE_READWRITE) };
+        self.memory = unsafe {
+            VirtualAlloc(
+                None,
+                bitmap_memory_size,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+        };
 
         self.pitch = (width * BYTES_PER_PIXEL) as isize;
         // TODO(aalhendi): Probably clear this to black
@@ -291,8 +302,9 @@ extern "system" fn win32_main_window_callback(
             }
             WM_KEYDOWN | WM_KEYUP | WM_SYSKEYDOWN | WM_SYSKEYUP => {
                 let virtual_key_code = wparam;
-                let was_down = (lparam.0 & (1 << 30)) != 0;
-                let is_down = (lparam.0 & (1 << 31)) == 0;
+                let was_down = (lparam.0 & (1 << KEY_MESSAGE_WAS_DOWN_BIT)) != 0;
+                let is_down = (lparam.0 & (1 << KEY_MESSAGE_IS_DOWN_BIT)) == 0;
+                let is_alt_down = (lparam.0 & (1 << KEY_MESSAGE_IS_ALT_BIT)) != 0;
                 if was_down != is_down {
                     match VIRTUAL_KEY(virtual_key_code.0 as u16) {
                         VK_W => println!("W key pressed"),
@@ -307,6 +319,10 @@ extern "system" fn win32_main_window_callback(
                         VK_RIGHT => println!("Right key pressed"),
                         VK_ESCAPE => println!("Escape key pressed"),
                         VK_SPACE => println!("Space key pressed"),
+                        VK_F4 if is_alt_down => {
+                            println!("Alt + F4 pressed, quitting...");
+                            GLOBAL_RUNNING = false;
+                        }
                         _ => {}
                     }
                 }
