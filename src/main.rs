@@ -6,9 +6,15 @@ use windows::{
     Win32::{
         Foundation::*,
         Graphics::Gdi::*,
+        Media::Audio::{
+            DirectSound::{DSBCAPS_PRIMARYBUFFER, DSBUFFERDESC, DSSCL_PRIORITY, DirectSoundCreate},
+            WAVE_FORMAT_PCM, WAVEFORMATEX,
+        },
         System::{
             LibraryLoader::GetModuleHandleA,
-            Memory::{MEM_COMMIT, MEM_RELEASE, PAGE_READWRITE, VirtualAlloc, VirtualFree},
+            Memory::{
+                MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+            },
         },
         UI::{
             Input::{
@@ -35,6 +41,9 @@ const BYTES_PER_PIXEL: i32 = 4;
 const KEY_MESSAGE_WAS_DOWN_BIT: i32 = 30;
 const KEY_MESSAGE_IS_DOWN_BIT: i32 = 31;
 const KEY_MESSAGE_IS_ALT_BIT: i32 = 29;
+
+const SAMPLES_PER_SECOND: u32 = 48000;
+const BUFFER_SIZE: u32 = 48000 * 2 * 2; // 2 channels, 2 bytes per sample
 
 // TODO(aalhendi): This is a global for now.
 static mut GLOBAL_RUNNING: bool = false;
@@ -210,6 +219,68 @@ fn main() -> Result<()> {
         let device_context = GetDC(Some(window_handle));
         let mut x_offset = 0;
         let mut y_offset = 0;
+
+        // cant load direct sound till we have a window handle
+        let mut ds = None;
+        DirectSoundCreate(None, &mut ds, None)?;
+        if ds.is_none() {
+            panic!("Failed to create direct sound");
+        }
+        let ds = ds.unwrap();
+        ds.SetCooperativeLevel(window_handle, DSSCL_PRIORITY)?;
+        let primary_buffer_desc = DSBUFFERDESC {
+            dwSize: size_of::<DSBUFFERDESC>() as u32,
+            dwFlags: DSBCAPS_PRIMARYBUFFER,
+            dwBufferBytes: 0,
+            dwReserved: 0,
+            // NOTE(aalhendi): we actually can't set the format here, we have to set it later via SetFormat. Windows!
+            lpwfxFormat: std::ptr::null_mut(),
+            guid3DAlgorithm: GUID::zeroed(),
+        };
+
+        let mut primary_buffer = core::mem::zeroed();
+        ds.CreateSoundBuffer(&primary_buffer_desc, &mut primary_buffer, None)?;
+        if primary_buffer.is_none() {
+            panic!("Failed to create primary buffer");
+        }
+        let primary_buffer = primary_buffer.unwrap();
+
+        // TODO(aalhendi): Move this to a function
+        // TODO(aalhendi): make BYTES_PER_SAMPLE and SAMPLES_PER_SECOND variables in the scope of this fn
+        let mut wave_format = {
+            let n_channels = 2;
+            let bits_per_sample = 16;
+            let n_block_align = (n_channels * bits_per_sample) / 8;
+            let n_samples_per_sec = SAMPLES_PER_SECOND;
+            WAVEFORMATEX {
+                wFormatTag: WAVE_FORMAT_PCM as u16,
+                nChannels: n_channels,
+                nBlockAlign: n_block_align,
+                nSamplesPerSec: n_samples_per_sec,
+                nAvgBytesPerSec: n_samples_per_sec * n_block_align as u32,
+                wBitsPerSample: bits_per_sample,
+                cbSize: 0,
+            }
+        };
+        primary_buffer.SetFormat(&wave_format)?;
+
+        let secondary_buffer_desc = DSBUFFERDESC {
+            dwSize: size_of::<DSBUFFERDESC>() as u32,
+            dwFlags: 0,
+            dwBufferBytes: BUFFER_SIZE,
+            dwReserved: 0,
+            lpwfxFormat: &mut wave_format,
+            guid3DAlgorithm: GUID::zeroed(),
+        };
+
+        let mut secondary_buffer = core::mem::zeroed();
+        ds.CreateSoundBuffer(&secondary_buffer_desc, &mut secondary_buffer, None)?;
+        if secondary_buffer.is_none() {
+            panic!("Failed to create secondary buffer");
+        }
+        // let secondary_buffer = secondary_buffer.unwrap();
+        // secondary_buffer.SetFormat(&wave_format)?;
+
         GLOBAL_RUNNING = true;
         while GLOBAL_RUNNING {
             let mut message = MSG::default();
