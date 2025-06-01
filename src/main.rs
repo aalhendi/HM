@@ -7,7 +7,10 @@ use windows::{
         Foundation::*,
         Graphics::Gdi::*,
         Media::Audio::{
-            DirectSound::{DSBCAPS_PRIMARYBUFFER, DSBUFFERDESC, DSSCL_PRIORITY, DirectSoundCreate},
+            DirectSound::{
+                DSBCAPS_PRIMARYBUFFER, DSBPLAY_LOOPING, DSBUFFERDESC, DSSCL_PRIORITY,
+                DirectSoundCreate,
+            },
             WAVE_FORMAT_PCM, WAVEFORMATEX,
         },
         System::{
@@ -42,8 +45,16 @@ const KEY_MESSAGE_WAS_DOWN_BIT: i32 = 30;
 const KEY_MESSAGE_IS_DOWN_BIT: i32 = 31;
 const KEY_MESSAGE_IS_ALT_BIT: i32 = 29;
 
+// NOTE(aalhendi): Audio constants
 const SAMPLES_PER_SECOND: u32 = 48000;
 const BUFFER_SIZE: u32 = 48000 * 2 * 2; // 2 channels, 2 bytes per sample
+const TONE_HZ: u32 = 256;
+const SQUARE_WAVE_PERIOD: u32 = SAMPLES_PER_SECOND / TONE_HZ;
+const HALF_SQUARE_WAVE_PERIOD: u32 = SQUARE_WAVE_PERIOD / 2;
+const BYTES_PER_SAMPLE: u32 = size_of::<i16>() as u32 * 2;
+const TONE_VOLUME: i16 = 3000;
+// TODO(aalhendi): This is a global for now.
+static mut SOUND_IS_PLAYING: bool = false;
 
 // TODO(aalhendi): This is a global for now.
 static mut GLOBAL_RUNNING: bool = false;
@@ -217,8 +228,14 @@ fn main() -> Result<()> {
 
         // NOTE(aalhendi): By using CS_OWNDC, can get one device context and keep using it forever since it is not shared.
         let device_context = GetDC(Some(window_handle));
+
+        // NOTE(aalhendi): Graphics test
         let mut x_offset = 0;
         let mut y_offset = 0;
+
+        // NOTE(aalhendi): Audio test
+        let mut running_sample_index = 0u32;
+        let bits_per_sample = 16;
 
         // cant load direct sound till we have a window handle
         let mut ds = None;
@@ -249,7 +266,6 @@ fn main() -> Result<()> {
         // TODO(aalhendi): make BYTES_PER_SAMPLE and SAMPLES_PER_SECOND variables in the scope of this fn
         let mut wave_format = {
             let n_channels = 2;
-            let bits_per_sample = 16;
             let n_block_align = (n_channels * bits_per_sample) / 8;
             let n_samples_per_sec = SAMPLES_PER_SECOND;
             WAVEFORMATEX {
@@ -278,8 +294,12 @@ fn main() -> Result<()> {
         if secondary_buffer.is_none() {
             panic!("Failed to create secondary buffer");
         }
-        // let secondary_buffer = secondary_buffer.unwrap();
-        // secondary_buffer.SetFormat(&wave_format)?;
+        let secondary_buffer = secondary_buffer.unwrap();
+        // NOTE(aalhendi): hack to fill buffer before first play
+        if !SOUND_IS_PLAYING {
+            secondary_buffer.Play(0, 0, DSBPLAY_LOOPING)?;
+            SOUND_IS_PLAYING = true;
+        }
 
         GLOBAL_RUNNING = true;
         while GLOBAL_RUNNING {
@@ -343,6 +363,107 @@ fn main() -> Result<()> {
             );
 
             GLOBAL_BACKBUFFER.render_weird_gradient(x_offset, y_offset);
+
+            // NOTE(aalhendi): direct sound test
+            // offset, in bytes, of the play cursor
+            let mut play_cursor = 0u32;
+            // offset, in bytes, of the write cursor
+            let mut write_cursor = 0u32;
+            secondary_buffer.GetCurrentPosition(Some(&mut play_cursor), Some(&mut write_cursor))?;
+
+            // lock offset
+            let bytes_to_lock =
+                running_sample_index.overflowing_mul(BYTES_PER_SAMPLE).0 % BUFFER_SIZE;
+
+            // lock size
+            // TODO(aalhendi): we need a more accurate check than bytes_to_lock == play_cursor. play cursor might be being updated weirdly from the hardware.
+            let mut bytes_to_write = if bytes_to_lock == play_cursor {
+                BUFFER_SIZE
+            } else if bytes_to_lock > play_cursor {
+                // case 1: we are wrapping around the ring buffer, fill 2 regions
+                (BUFFER_SIZE - bytes_to_lock) + play_cursor
+            } else {
+                // case 2: we are not wrapping around the ring buffer, fill 1 region
+                play_cursor - bytes_to_lock
+            };
+
+            if bytes_to_write == 0 {
+                bytes_to_write = BUFFER_SIZE / 4;
+            }
+
+            // To be filled by Lock:
+            let mut region1_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+            let mut region1_size: u32 = 0;
+            let mut region2_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+            let mut region2_size: u32 = 0;
+
+            secondary_buffer.Lock(
+                bytes_to_lock,
+                bytes_to_write,
+                &mut region1_ptr,
+                &mut region1_size,
+                Some(&mut region2_ptr),
+                Some(&mut region2_size),
+                0,
+            )?;
+
+            // TODO(aalhendi): assert that region1_size , region2_size are valid
+
+            let region1_sample_count = region1_size / BYTES_PER_SAMPLE;
+            let mut sample_out = region1_ptr as *mut i16;
+            for _sample_index in 0..region1_sample_count {
+                let sample_value = if ((running_sample_index / HALF_SQUARE_WAVE_PERIOD) % 2) != 0 {
+                    TONE_VOLUME
+                } else {
+                    -TONE_VOLUME
+                };
+
+                // basically, we write L/R L/R L/R L/R etc.
+                // we use sample_out as an i16 ptr to the memory location we want to write to (region1 / ringbuffer)
+                *sample_out = sample_value;
+                sample_out = sample_out.offset(1);
+                *sample_out = sample_value;
+                sample_out = sample_out.offset(1);
+
+                running_sample_index = running_sample_index.overflowing_add(1).0;
+            }
+
+            // in the case where we are wrapping around the ring buffer, we need to fill region2
+            // todo(aalhendi): same loop as above, but for region2, can we collapse the 2 loops?
+            if !region2_ptr.is_null() {
+                let region2_sample_count = region2_size / BYTES_PER_SAMPLE;
+                sample_out = region2_ptr as *mut i16;
+                for _sample_index in 0..region2_sample_count {
+                    let sample_value =
+                        if ((running_sample_index / HALF_SQUARE_WAVE_PERIOD) % 2) != 0 {
+                            TONE_VOLUME
+                        } else {
+                            -TONE_VOLUME
+                        };
+
+                    *sample_out = sample_value;
+                    sample_out = sample_out.offset(1);
+                    *sample_out = sample_value;
+                    sample_out = sample_out.offset(1);
+
+                    running_sample_index = running_sample_index.overflowing_add(1).0;
+                }
+            }
+
+            // for some reason, unlock expects a different signature than lock... so we have to do this
+            // refactor(aalhendi): we can have 2 unlock calls, one running if region2_ptr is null, and the other running if it is not null after the write
+            let (final_ptr_region2, final_size_region2) = if region2_ptr.is_null() {
+                (None, 0)
+            } else {
+                (Some(region2_ptr as *const std::ffi::c_void), region2_size)
+            };
+
+            secondary_buffer.Unlock(
+                region1_ptr as *const std::ffi::c_void,
+                region1_size,
+                final_ptr_region2,
+                final_size_region2,
+            )?;
 
             let dims = Win32WindowDimension::from(window_handle);
             GLOBAL_BACKBUFFER.win32_copy_buffer_to_window(device_context, dims.width, dims.height);
