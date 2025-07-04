@@ -9,7 +9,7 @@ use windows::{
         Media::Audio::{
             DirectSound::{
                 DSBCAPS_PRIMARYBUFFER, DSBPLAY_LOOPING, DSBUFFERDESC, DSSCL_PRIORITY,
-                DirectSoundCreate,
+                DirectSoundCreate, IDirectSoundBuffer,
             },
             WAVE_FORMAT_PCM, WAVEFORMATEX,
         },
@@ -45,17 +45,6 @@ const KEY_MESSAGE_WAS_DOWN_BIT: i32 = 30;
 const KEY_MESSAGE_IS_DOWN_BIT: i32 = 31;
 const KEY_MESSAGE_IS_ALT_BIT: i32 = 29;
 
-// NOTE(aalhendi): Audio constants
-const SAMPLES_PER_SECOND: u32 = 48000;
-const BUFFER_SIZE: u32 = 48000 * 2 * 2; // 2 channels, 2 bytes per sample
-const TONE_HZ: u32 = 256;
-const SQUARE_WAVE_PERIOD: u32 = SAMPLES_PER_SECOND / TONE_HZ;
-const HALF_SQUARE_WAVE_PERIOD: u32 = SQUARE_WAVE_PERIOD / 2;
-const BYTES_PER_SAMPLE: u32 = size_of::<i16>() as u32 * 2;
-const TONE_VOLUME: i16 = 3000;
-// TODO(aalhendi): This is a global for now.
-static mut SOUND_IS_PLAYING: bool = false;
-
 // TODO(aalhendi): This is a global for now.
 static mut GLOBAL_RUNNING: bool = false;
 static mut GLOBAL_BACKBUFFER: Win32OffscreenBuffer = Win32OffscreenBuffer {
@@ -65,6 +54,203 @@ static mut GLOBAL_BACKBUFFER: Win32OffscreenBuffer = Win32OffscreenBuffer {
     height: 0,
     pitch: 0,
 };
+
+// NOTE(aalhendi): we return the ds, primary_buffer, secondary_buffer to avoid them being dropped.
+// we're not making them global for now
+fn win32_init_dsound(
+    window_handle: HWND,
+    sound_output: &mut Win32SoundOutput,
+) -> windows::core::Result<(
+    windows::Win32::Media::Audio::DirectSound::IDirectSound,
+    IDirectSoundBuffer,
+    IDirectSoundBuffer,
+)> {
+    let mut ds = None;
+    unsafe {
+        DirectSoundCreate(None, &mut ds, None)?;
+    }
+    if ds.is_none() {
+        panic!("Failed to create direct sound");
+    }
+    let ds = ds.unwrap();
+    unsafe {
+        ds.SetCooperativeLevel(window_handle, DSSCL_PRIORITY)?;
+    }
+    let primary_buffer_desc = DSBUFFERDESC {
+        dwSize: size_of::<DSBUFFERDESC>() as u32,
+        dwFlags: DSBCAPS_PRIMARYBUFFER,
+        dwBufferBytes: 0,
+        dwReserved: 0,
+        // NOTE(aalhendi): we actually can't set the format here, we have to set it later via SetFormat. Windows!
+        lpwfxFormat: std::ptr::null_mut(),
+        guid3DAlgorithm: GUID::zeroed(),
+    };
+
+    let mut primary_buffer = None;
+    unsafe {
+        ds.CreateSoundBuffer(&primary_buffer_desc, &mut primary_buffer, None)?;
+    }
+    if primary_buffer.is_none() {
+        panic!("Failed to create primary buffer");
+    }
+    let primary_buffer = primary_buffer.unwrap();
+
+    let mut wave_format = {
+        let n_channels = 2;
+        let n_block_align = (n_channels * 16) / 8; // TODO(aalhendi): remove hardcoded 16, use sound_output.bytes_per_sample?
+        WAVEFORMATEX {
+            wFormatTag: WAVE_FORMAT_PCM as u16,
+            nChannels: n_channels,
+            nBlockAlign: n_block_align,
+            nSamplesPerSec: sound_output.samples_per_second,
+            nAvgBytesPerSec: sound_output.samples_per_second * n_block_align as u32,
+            wBitsPerSample: 16, // TODO(aalhendi): remove hardcoded 16, use sound_output.bytes_per_sample?
+            cbSize: 0,
+        }
+    };
+    unsafe {
+        primary_buffer.SetFormat(&wave_format)?;
+    }
+
+    let secondary_buffer_desc = DSBUFFERDESC {
+        dwSize: size_of::<DSBUFFERDESC>() as u32,
+        dwFlags: 0,
+        dwBufferBytes: sound_output.buffer_size,
+        dwReserved: 0,
+        lpwfxFormat: &mut wave_format,
+        guid3DAlgorithm: GUID::zeroed(),
+    };
+
+    let mut secondary_buffer = None;
+    unsafe {
+        ds.CreateSoundBuffer(&secondary_buffer_desc, &mut secondary_buffer, None)?;
+    }
+    if secondary_buffer.is_none() {
+        panic!("Failed to create secondary buffer");
+    }
+    let secondary_buffer = secondary_buffer.unwrap();
+
+    Ok((ds, primary_buffer, secondary_buffer))
+}
+
+struct Win32SoundOutput {
+    samples_per_second: u32,
+    tone_hz: u32,
+    tone_volume: i16,
+    running_sample_index: u32,
+    wave_period: u32,
+    bytes_per_sample: u32,
+    buffer_size: u32,
+    t_sine: f32,
+    latency_sample_count: u32,
+}
+
+impl Win32SoundOutput {
+    fn new(samples_per_second: u32, tone_hz: u32, tone_volume: i16) -> Self {
+        let bytes_per_sample = size_of::<i16>() as u32 * 2;
+
+        Self {
+            samples_per_second,
+            tone_hz,
+            tone_volume,
+            running_sample_index: 0,
+            wave_period: samples_per_second / tone_hz,
+            bytes_per_sample,
+            buffer_size: samples_per_second * bytes_per_sample, // 2 channels, 2 bytes per sample
+            t_sine: 0.0,
+            latency_sample_count: samples_per_second / 15,
+        }
+    }
+}
+
+fn win32_fill_sound_buffer(
+    // note(aalhendi): this is meant to be a "global" secondary buffer, but we are passing it in as an argument for now
+    secondary_buffer: &IDirectSoundBuffer,
+    sound_output: &mut Win32SoundOutput,
+    bytes_to_lock: u32,
+    bytes_to_write: u32,
+) -> windows::core::Result<()> {
+    // To be filled by Lock:
+    let mut region1_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+    let mut region1_size: u32 = 0;
+    let mut region2_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+    let mut region2_size: u32 = 0;
+
+    unsafe {
+        secondary_buffer.Lock(
+            bytes_to_lock,
+            bytes_to_write,
+            &mut region1_ptr,
+            &mut region1_size,
+            Some(&mut region2_ptr),
+            Some(&mut region2_size),
+            0,
+        )?;
+    }
+
+    // TODO(aalhendi): assert that region1_size , region2_size are valid
+
+    let region1_sample_count = region1_size / sound_output.bytes_per_sample;
+    let mut sample_out = region1_ptr as *mut i16;
+    for _sample_index in 0..region1_sample_count {
+        let sine_value = f32::sin(sound_output.t_sine);
+        let sample_value = (sine_value * sound_output.tone_volume as f32) as i16;
+
+        // basically, we write L/R L/R L/R L/R etc.
+        // we use sample_out as an i16 ptr to the memory location we want to write to (region1 / ringbuffer)
+        unsafe {
+            *sample_out = sample_value;
+            sample_out = sample_out.offset(1);
+            *sample_out = sample_value;
+            sample_out = sample_out.offset(1);
+        }
+
+        // move 1 sample worth forward
+        sound_output.t_sine +=
+            2_f32 * std::f32::consts::PI * 1_f32 / sound_output.wave_period as f32;
+        sound_output.running_sample_index = sound_output.running_sample_index.overflowing_add(1).0;
+    }
+
+    // in the case where we are wrapping around the ring buffer, we need to fill region2
+    // todo(aalhendi): same loop as above, but for region2, can we collapse the 2 loops?
+    if !region2_ptr.is_null() {
+        let region2_sample_count = region2_size / sound_output.bytes_per_sample;
+        sample_out = region2_ptr as *mut i16;
+        for _sample_index in 0..region2_sample_count {
+            let sine_value = f32::sin(sound_output.t_sine);
+            let sample_value = (sine_value * sound_output.tone_volume as f32) as i16;
+
+            unsafe {
+                *sample_out = sample_value;
+                sample_out = sample_out.offset(1);
+                *sample_out = sample_value;
+                sample_out = sample_out.offset(1);
+            }
+
+            sound_output.t_sine +=
+                2_f32 * std::f32::consts::PI * 1_f32 / sound_output.wave_period as f32;
+            sound_output.running_sample_index =
+                sound_output.running_sample_index.overflowing_add(1).0;
+        }
+    }
+
+    // for some reason, unlock expects a different signature than lock... so we have to do this
+    // refactor(aalhendi): we can have 2 unlock calls, one running if region2_ptr is null, and the other running if it is not null after the write
+    let (final_ptr_region2, final_size_region2) = if region2_ptr.is_null() {
+        (None, 0)
+    } else {
+        (Some(region2_ptr as *const std::ffi::c_void), region2_size)
+    };
+
+    unsafe {
+        secondary_buffer.Unlock(
+            region1_ptr as *const std::ffi::c_void,
+            region1_size,
+            final_ptr_region2,
+            final_size_region2,
+        )
+    }
+}
 
 struct Win32WindowDimension {
     width: i32,
@@ -234,72 +420,23 @@ fn main() -> Result<()> {
         let mut y_offset = 0;
 
         // NOTE(aalhendi): Audio test
-        let mut running_sample_index = 0u32;
-        let bits_per_sample = 16;
+        // TODO(aalhendi): make this sixty seconds?
+        let mut sound_output = Win32SoundOutput::new(48000, 256, 3000);
 
         // cant load direct sound till we have a window handle
-        let mut ds = None;
-        DirectSoundCreate(None, &mut ds, None)?;
-        if ds.is_none() {
-            panic!("Failed to create direct sound");
-        }
-        let ds = ds.unwrap();
-        ds.SetCooperativeLevel(window_handle, DSSCL_PRIORITY)?;
-        let primary_buffer_desc = DSBUFFERDESC {
-            dwSize: size_of::<DSBUFFERDESC>() as u32,
-            dwFlags: DSBCAPS_PRIMARYBUFFER,
-            dwBufferBytes: 0,
-            dwReserved: 0,
-            // NOTE(aalhendi): we actually can't set the format here, we have to set it later via SetFormat. Windows!
-            lpwfxFormat: std::ptr::null_mut(),
-            guid3DAlgorithm: GUID::zeroed(),
-        };
+        let (_ds, _primary_buffer, secondary_buffer) =
+            win32_init_dsound(window_handle, &mut sound_output)?;
 
-        let mut primary_buffer = core::mem::zeroed();
-        ds.CreateSoundBuffer(&primary_buffer_desc, &mut primary_buffer, None)?;
-        if primary_buffer.is_none() {
-            panic!("Failed to create primary buffer");
-        }
-        let primary_buffer = primary_buffer.unwrap();
-
-        // TODO(aalhendi): Move this to a function
-        // TODO(aalhendi): make BYTES_PER_SAMPLE and SAMPLES_PER_SECOND variables in the scope of this fn
-        let mut wave_format = {
-            let n_channels = 2;
-            let n_block_align = (n_channels * bits_per_sample) / 8;
-            let n_samples_per_sec = SAMPLES_PER_SECOND;
-            WAVEFORMATEX {
-                wFormatTag: WAVE_FORMAT_PCM as u16,
-                nChannels: n_channels,
-                nBlockAlign: n_block_align,
-                nSamplesPerSec: n_samples_per_sec,
-                nAvgBytesPerSec: n_samples_per_sec * n_block_align as u32,
-                wBitsPerSample: bits_per_sample,
-                cbSize: 0,
-            }
-        };
-        primary_buffer.SetFormat(&wave_format)?;
-
-        let secondary_buffer_desc = DSBUFFERDESC {
-            dwSize: size_of::<DSBUFFERDESC>() as u32,
-            dwFlags: 0,
-            dwBufferBytes: BUFFER_SIZE,
-            dwReserved: 0,
-            lpwfxFormat: &mut wave_format,
-            guid3DAlgorithm: GUID::zeroed(),
-        };
-
-        let mut secondary_buffer = core::mem::zeroed();
-        ds.CreateSoundBuffer(&secondary_buffer_desc, &mut secondary_buffer, None)?;
-        if secondary_buffer.is_none() {
-            panic!("Failed to create secondary buffer");
-        }
-        let secondary_buffer = secondary_buffer.unwrap();
-        // NOTE(aalhendi): hack to fill buffer before first play
-        if !SOUND_IS_PLAYING {
-            secondary_buffer.Play(0, 0, DSBPLAY_LOOPING)?;
-            SOUND_IS_PLAYING = true;
-        }
+        // note(aalhendi): hack to copy buffer_size. we cant borrow immutable from mutable... should be handled by compiler
+        let initial_bytes_to_write =
+            sound_output.latency_sample_count * sound_output.bytes_per_sample;
+        win32_fill_sound_buffer(
+            &secondary_buffer,
+            &mut sound_output,
+            0,
+            initial_bytes_to_write,
+        )?;
+        secondary_buffer.Play(0, 0, DSBPLAY_LOOPING)?;
 
         GLOBAL_RUNNING = true;
         while GLOBAL_RUNNING {
@@ -332,7 +469,7 @@ fn main() -> Result<()> {
                     let _right_thumb = pad.wButtons & XINPUT_GAMEPAD_RIGHT_THUMB;
                     let _left_shoulder = pad.wButtons & XINPUT_GAMEPAD_LEFT_SHOULDER;
                     let _right_shoulder = pad.wButtons & XINPUT_GAMEPAD_RIGHT_SHOULDER;
-                    let a_button = pad.wButtons & XINPUT_GAMEPAD_A;
+                    let _a_button = pad.wButtons & XINPUT_GAMEPAD_A;
                     let _b_button = pad.wButtons & XINPUT_GAMEPAD_B;
                     let _x_button = pad.wButtons & XINPUT_GAMEPAD_X;
                     let _y_button = pad.wButtons & XINPUT_GAMEPAD_Y;
@@ -342,12 +479,18 @@ fn main() -> Result<()> {
                     let _stick_right_x = pad.sThumbRX;
                     let _stick_right_y = pad.sThumbRY;
 
-                    x_offset += (stick_left_x as i32) >> 12;
-                    y_offset += (stick_left_y as i32) >> 12;
+                    // NOTE(aalhendi): we will do deadzone handling later using XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE 8689
+                    x_offset += (stick_left_x as i32) / 4096;
+                    y_offset += (stick_left_y as i32) / 4096;
 
-                    if a_button.0 != 0 {
-                        y_offset += 2;
-                    }
+                    sound_output.tone_hz =
+                        (512_i32 + ((256_f32 * (stick_left_y as f32 / 30_000_f32)) as i32)) as u32;
+                    // NOTE(aalhendi): could be done neater by splitting into offset and base.
+                    // also could have used clamp to prevent division by zero
+                    // let tone_offset = (256_f32 * (stick_left_y as f32 / 30_000_f32)) as i32;
+                    // sound_output.tone_hz = (512 + tone_offset).clamp(100, 2000) as u32;
+                    sound_output.wave_period =
+                        sound_output.samples_per_second / sound_output.tone_hz;
                 } else {
                     // NOTE(aalhendi): This controller is not available
                 }
@@ -372,98 +515,38 @@ fn main() -> Result<()> {
             secondary_buffer.GetCurrentPosition(Some(&mut play_cursor), Some(&mut write_cursor))?;
 
             // lock offset
-            let bytes_to_lock =
-                running_sample_index.overflowing_mul(BYTES_PER_SAMPLE).0 % BUFFER_SIZE;
+            let bytes_to_lock = sound_output
+                .running_sample_index
+                .overflowing_mul(sound_output.bytes_per_sample)
+                .0
+                % sound_output.buffer_size;
 
             // lock size
-            // TODO(aalhendi): we need a more accurate check than bytes_to_lock == play_cursor. play cursor might be being updated weirdly from the hardware.
-            let mut bytes_to_write = if bytes_to_lock == play_cursor {
-                BUFFER_SIZE
-            } else if bytes_to_lock > play_cursor {
+            let target_write_cursor = (play_cursor
+                + (sound_output.latency_sample_count * sound_output.bytes_per_sample))
+                % sound_output.buffer_size;
+            // TODO(aalhendi): change to lower latency offset from the play cursor when we actually start having sound effects
+            let bytes_to_write = if bytes_to_lock > target_write_cursor {
                 // case 1: we are wrapping around the ring buffer, fill 2 regions
-                (BUFFER_SIZE - bytes_to_lock) + play_cursor
+                (sound_output.buffer_size - bytes_to_lock) + target_write_cursor
             } else {
                 // case 2: we are not wrapping around the ring buffer, fill 1 region
-                play_cursor - bytes_to_lock
+                target_write_cursor - bytes_to_lock
             };
 
-            if bytes_to_write == 0 {
-                bytes_to_write = BUFFER_SIZE / 4;
-            }
-
-            // To be filled by Lock:
-            let mut region1_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
-            let mut region1_size: u32 = 0;
-            let mut region2_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
-            let mut region2_size: u32 = 0;
-
-            secondary_buffer.Lock(
+            // NOTE(aalhendi): ideally, we want to only fill sound buffer if there's something to write.
+            // this fn calls Lock(), which can fail if bytes_to_write is 0
+            // we are ignoring the error for now, skipping this frame if it fails. This is to match C behavior.
+            // from testing, this only happens the first time call occurs. we could have a if check to see if bytes_to_write is 0
+            // but that check would run every frame, which is not ideal.
+            if let Err(e) = win32_fill_sound_buffer(
+                &secondary_buffer,
+                &mut sound_output,
                 bytes_to_lock,
                 bytes_to_write,
-                &mut region1_ptr,
-                &mut region1_size,
-                Some(&mut region2_ptr),
-                Some(&mut region2_size),
-                0,
-            )?;
-
-            // TODO(aalhendi): assert that region1_size , region2_size are valid
-
-            let region1_sample_count = region1_size / BYTES_PER_SAMPLE;
-            let mut sample_out = region1_ptr as *mut i16;
-            for _sample_index in 0..region1_sample_count {
-                let sample_value = if ((running_sample_index / HALF_SQUARE_WAVE_PERIOD) % 2) != 0 {
-                    TONE_VOLUME
-                } else {
-                    -TONE_VOLUME
-                };
-
-                // basically, we write L/R L/R L/R L/R etc.
-                // we use sample_out as an i16 ptr to the memory location we want to write to (region1 / ringbuffer)
-                *sample_out = sample_value;
-                sample_out = sample_out.offset(1);
-                *sample_out = sample_value;
-                sample_out = sample_out.offset(1);
-
-                running_sample_index = running_sample_index.overflowing_add(1).0;
+            ) {
+                println!("Error filling sound buffer: {e:?}");
             }
-
-            // in the case where we are wrapping around the ring buffer, we need to fill region2
-            // todo(aalhendi): same loop as above, but for region2, can we collapse the 2 loops?
-            if !region2_ptr.is_null() {
-                let region2_sample_count = region2_size / BYTES_PER_SAMPLE;
-                sample_out = region2_ptr as *mut i16;
-                for _sample_index in 0..region2_sample_count {
-                    let sample_value =
-                        if ((running_sample_index / HALF_SQUARE_WAVE_PERIOD) % 2) != 0 {
-                            TONE_VOLUME
-                        } else {
-                            -TONE_VOLUME
-                        };
-
-                    *sample_out = sample_value;
-                    sample_out = sample_out.offset(1);
-                    *sample_out = sample_value;
-                    sample_out = sample_out.offset(1);
-
-                    running_sample_index = running_sample_index.overflowing_add(1).0;
-                }
-            }
-
-            // for some reason, unlock expects a different signature than lock... so we have to do this
-            // refactor(aalhendi): we can have 2 unlock calls, one running if region2_ptr is null, and the other running if it is not null after the write
-            let (final_ptr_region2, final_size_region2) = if region2_ptr.is_null() {
-                (None, 0)
-            } else {
-                (Some(region2_ptr as *const std::ffi::c_void), region2_size)
-            };
-
-            secondary_buffer.Unlock(
-                region1_ptr as *const std::ffi::c_void,
-                region1_size,
-                final_ptr_region2,
-                final_size_region2,
-            )?;
 
             let dims = Win32WindowDimension::from(window_handle);
             GLOBAL_BACKBUFFER.win32_copy_buffer_to_window(device_context, dims.width, dims.height);
