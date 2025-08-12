@@ -1,6 +1,6 @@
 #![allow(static_mut_refs)]
 
-use std::{mem::size_of, ptr};
+use std::{arch::x86_64::_rdtsc, mem::size_of, ptr};
 
 use windows::{
     Win32::{
@@ -18,6 +18,7 @@ use windows::{
             Memory::{
                 MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
             },
+            Performance::{QueryPerformanceCounter, QueryPerformanceFrequency},
         },
         UI::{
             Input::{
@@ -372,6 +373,9 @@ fn main() -> Result<()> {
     unsafe {
         let module_handle = GetModuleHandleA(None)?;
 
+        let mut perf_count_frequency = 0;
+        QueryPerformanceFrequency(&mut perf_count_frequency)?;
+
         GLOBAL_BACKBUFFER.win32_resize_dib_section(1280, 720);
 
         let wc = WNDCLASSA {
@@ -437,6 +441,11 @@ fn main() -> Result<()> {
             initial_bytes_to_write,
         )?;
         secondary_buffer.Play(0, 0, DSBPLAY_LOOPING)?;
+
+        let mut last_counter = 0;
+        QueryPerformanceCounter(&mut last_counter)?;
+        // TODO(aalhendi): do we want to use rdtscp instead?
+        let mut last_cycle_count = _rdtsc();
 
         GLOBAL_RUNNING = true;
         while GLOBAL_RUNNING {
@@ -550,6 +559,22 @@ fn main() -> Result<()> {
 
             let dims = Win32WindowDimension::from(window_handle);
             GLOBAL_BACKBUFFER.win32_copy_buffer_to_window(device_context, dims.width, dims.height);
+
+            let end_cycle_count = _rdtsc();
+
+            let mut end_counter = 0;
+            QueryPerformanceCounter(&mut end_counter)?;
+
+            let cycles_elapsed = end_cycle_count as f64 - last_cycle_count as f64;
+            let counter_elapsed = end_counter as f64 - last_counter as f64;
+            let ms_per_frame = (1_000_f64 * counter_elapsed) / perf_count_frequency as f64;
+            let fps = perf_count_frequency as f64 / counter_elapsed;
+            println!(
+                "{ms_per_frame:.2} ms/frame - {fps:.1} fps - {mc:.2} mega_cycles/frame",
+                mc = cycles_elapsed as f64 / (1_000_f64 * 1_000_f64)
+            );
+            last_counter = end_counter;
+            last_cycle_count = end_cycle_count;
         }
 
         Ok(())

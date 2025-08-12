@@ -20,6 +20,7 @@ features = [
     "Win32_Graphics_Gdi",
     "Win32_System_LibraryLoader",
     "Win32_System_Memory",
+    "Win32_System_Performance",
     "Win32_UI_Input_XboxController",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_Media_Audio_DirectSound",
