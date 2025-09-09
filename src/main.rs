@@ -41,6 +41,27 @@ use windows::{
     core::*,
 };
 
+use hm::{GameOffscreenBuffer, GameSoundOutputBuffer, game_update_and_render};
+
+/* TODO(aalhendi): THIS IS NOT A FINAL PLATFORM LAYER!!!
+
+- Saved game locations
+- Getting a handle to our own executable file
+- Asset loading path
+- Threading (launch a thread)
+- Raw Input (support for multiple keyboards)
+- Sleep/timeBeginPeriod
+- ClipCursor() (for multimonitor support)
+- Fullscreen support
+- WM_SETCURSOR (control cursor visibility)
+- QueryCancelAutoPlay()
+- WM_ACTIVATEAPP (for when we are not the active application)
+- Blit speed improvements (BitBlt)
+- Hardware acceleration (OpenGL, Direct3d or BOTH??)
+- GetKeyboardLayout() (for intl WASD support)
+
+*/
+
 const BYTES_PER_PIXEL: i32 = 4;
 const KEY_MESSAGE_WAS_DOWN_BIT: i32 = 30;
 const KEY_MESSAGE_IS_DOWN_BIT: i32 = 31;
@@ -49,7 +70,7 @@ const KEY_MESSAGE_IS_ALT_BIT: i32 = 29;
 // TODO(aalhendi): This is a global for now.
 static mut GLOBAL_RUNNING: bool = false;
 static mut GLOBAL_BACKBUFFER: Win32OffscreenBuffer = Win32OffscreenBuffer {
-    info: unsafe { core::mem::zeroed() }, // alloc'ed in resize, called v.early in main fn
+    info: unsafe { core::mem::zeroed() }, // alloc'ed in win32_resize_dib_section, called v.early in main fn
     memory: ptr::null_mut(),
     width: 0,
     height: 0,
@@ -137,31 +158,72 @@ fn win32_init_dsound(
 struct Win32SoundOutput {
     samples_per_second: u32,
     tone_hz: u32,
-    tone_volume: i16,
     running_sample_index: u32,
     wave_period: u32,
     bytes_per_sample: u32,
     buffer_size: u32,
-    t_sine: f32,
     latency_sample_count: u32,
 }
 
 impl Win32SoundOutput {
-    fn new(samples_per_second: u32, tone_hz: u32, tone_volume: i16) -> Self {
+    fn new(samples_per_second: u32, tone_hz: u32) -> Self {
         let bytes_per_sample = size_of::<i16>() as u32 * 2;
 
         Self {
             samples_per_second,
             tone_hz,
-            tone_volume,
             running_sample_index: 0,
             wave_period: samples_per_second / tone_hz,
             bytes_per_sample,
             buffer_size: samples_per_second * bytes_per_sample, // 2 channels, 2 bytes per sample
-            t_sine: 0.0,
             latency_sample_count: samples_per_second / 15,
         }
     }
+}
+
+fn win32_clear_sound_buffer(
+    secondary_buffer: &IDirectSoundBuffer,
+    sound_output: &mut Win32SoundOutput,
+) -> windows::core::Result<()> {
+    // To be filled by Lock:
+    let mut region1_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+    let mut region1_size: u32 = 0;
+    let mut region2_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+    let mut region2_size: u32 = 0;
+    unsafe {
+        secondary_buffer.Lock(
+            0,
+            sound_output.buffer_size,
+            &mut region1_ptr,
+            &mut region1_size,
+            Some(&mut region2_ptr),
+            Some(&mut region2_size),
+            0,
+        )?;
+    }
+
+    let mut dest_sample = region1_ptr as *mut u8;
+    for _byte_index in 0..region1_size {
+        unsafe {
+            *dest_sample = 0;
+            dest_sample = dest_sample.offset(1);
+        }
+    }
+
+    // NOTE(aalhendi): region2 is not null if we are wrapping around the ring buffer... and we expect a contiguous region at startup so this will rarely be hit.
+    dest_sample = region2_ptr as *mut u8;
+    for _byte_index in 0..region2_size {
+        unsafe {
+            *dest_sample = 0;
+            dest_sample = dest_sample.offset(1);
+        }
+    }
+
+    unsafe {
+        secondary_buffer.Unlock(region1_ptr, region1_size, None, 0)?;
+    }
+
+    Ok(())
 }
 
 fn win32_fill_sound_buffer(
@@ -170,6 +232,7 @@ fn win32_fill_sound_buffer(
     sound_output: &mut Win32SoundOutput,
     bytes_to_lock: u32,
     bytes_to_write: u32,
+    source_buffer: &mut GameSoundOutputBuffer,
 ) -> windows::core::Result<()> {
     // To be filled by Lock:
     let mut region1_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
@@ -192,23 +255,19 @@ fn win32_fill_sound_buffer(
     // TODO(aalhendi): assert that region1_size , region2_size are valid
 
     let region1_sample_count = region1_size / sound_output.bytes_per_sample;
-    let mut sample_out = region1_ptr as *mut i16;
+    let mut dest_sample = region1_ptr as *mut i16;
+    let mut source_sample = source_buffer.samples;
     for _sample_index in 0..region1_sample_count {
-        let sine_value = f32::sin(sound_output.t_sine);
-        let sample_value = (sine_value * sound_output.tone_volume as f32) as i16;
-
         // basically, we write L/R L/R L/R L/R etc.
         // we use sample_out as an i16 ptr to the memory location we want to write to (region1 / ringbuffer)
         unsafe {
-            *sample_out = sample_value;
-            sample_out = sample_out.offset(1);
-            *sample_out = sample_value;
-            sample_out = sample_out.offset(1);
+            *dest_sample = *source_sample;
+            source_sample = source_sample.offset(1);
+            dest_sample = dest_sample.offset(1);
+            *dest_sample = *source_sample;
+            source_sample = source_sample.offset(1);
+            dest_sample = dest_sample.offset(1);
         }
-
-        // move 1 sample worth forward
-        sound_output.t_sine +=
-            2_f32 * std::f32::consts::PI * 1_f32 / sound_output.wave_period as f32;
         sound_output.running_sample_index = sound_output.running_sample_index.overflowing_add(1).0;
     }
 
@@ -216,20 +275,16 @@ fn win32_fill_sound_buffer(
     // todo(aalhendi): same loop as above, but for region2, can we collapse the 2 loops?
     if !region2_ptr.is_null() {
         let region2_sample_count = region2_size / sound_output.bytes_per_sample;
-        sample_out = region2_ptr as *mut i16;
+        dest_sample = region2_ptr as *mut i16;
         for _sample_index in 0..region2_sample_count {
-            let sine_value = f32::sin(sound_output.t_sine);
-            let sample_value = (sine_value * sound_output.tone_volume as f32) as i16;
-
             unsafe {
-                *sample_out = sample_value;
-                sample_out = sample_out.offset(1);
-                *sample_out = sample_value;
-                sample_out = sample_out.offset(1);
+                *dest_sample = *source_sample;
+                source_sample = source_sample.offset(1);
+                dest_sample = dest_sample.offset(1);
+                *dest_sample = *source_sample;
+                source_sample = source_sample.offset(1);
+                dest_sample = dest_sample.offset(1);
             }
-
-            sound_output.t_sine +=
-                2_f32 * std::f32::consts::PI * 1_f32 / sound_output.wave_period as f32;
             sound_output.running_sample_index =
                 sound_output.running_sample_index.overflowing_add(1).0;
         }
@@ -287,31 +342,6 @@ struct Win32OffscreenBuffer {
 }
 
 impl Win32OffscreenBuffer {
-    unsafe fn render_weird_gradient(&self, blue_offset: i32, green_offset: i32) {
-        let width = self.width;
-        let height = self.height;
-
-        let mut row = self.memory as *const u8;
-        for y in 0..height {
-            let mut pixel = row as *mut i32;
-            for x in 0..width {
-                /*
-                Padding is not put first even if its Little Endian because... Windows.
-                Memory (u32): BB GG RR XX
-                Register: XX RR GG BB where XX is padding 0
-                */
-                let blue = x.wrapping_add(blue_offset);
-                let green = y.wrapping_add(green_offset);
-
-                unsafe {
-                    *pixel = (green << 8) | blue;
-                    pixel = pixel.offset(1);
-                }
-            }
-            row = unsafe { row.offset(self.pitch) };
-        }
-    }
-
     unsafe fn win32_copy_buffer_to_window(&self, device_context: HDC, width: i32, height: i32) {
         // TODO(aalhendi): aspect ratio correction
         // TODO(aalhendi): play with stretch modes
@@ -346,13 +376,22 @@ impl Win32OffscreenBuffer {
         self.width = width;
         self.height = height;
 
-        self.info.bmiHeader.biSize = size_of::<BITMAPINFOHEADER>() as u32;
-        self.info.bmiHeader.biWidth = self.width;
-        // NOTE(aalhendi): When bHeight is negative, it clues Windows to treat the bitmap as top-down rather than bottom-up. This means tht the first three bytes are for the top-left pixel.
-        self.info.bmiHeader.biHeight = -self.height;
-        self.info.bmiHeader.biPlanes = 1;
-        self.info.bmiHeader.biBitCount = 32; // 8 for red, 8 for green, 8 for blue, ask for 32 for DWORD alignment
-        self.info.bmiHeader.biCompression = BI_RGB.0; // Uncompressed
+        let bitmap_info_header = BITMAPINFOHEADER {
+            biSize: size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: self.width,
+            // NOTE(aalhendi): When bHeight is negative, it clues Windows to treat the bitmap as top-down rather than bottom-up. This means tht the first three bytes are for the top-left pixel.
+            biHeight: -self.height,
+            biPlanes: 1,
+            biBitCount: 32, // 8 for red, 8 for green, 8 for blue, ask for 32 for DWORD alignment
+            biCompression: BI_RGB.0, // Uncompressed
+            biSizeImage: 0,
+            biXPelsPerMeter: 0,
+            biYPelsPerMeter: 0,
+            biClrUsed: 0,
+            biClrImportant: 0,
+        };
+
+        self.info.bmiHeader = bitmap_info_header;
 
         let bitmap_memory_size = (BYTES_PER_PIXEL * self.width * self.height) as usize;
         self.memory = unsafe {
@@ -425,29 +464,30 @@ fn main() -> Result<()> {
 
         // NOTE(aalhendi): Audio test
         // TODO(aalhendi): make this sixty seconds?
-        let mut sound_output = Win32SoundOutput::new(48000, 256, 3000);
+        let mut sound_output = Win32SoundOutput::new(48000, 256);
 
         // cant load direct sound till we have a window handle
         let (_ds, _primary_buffer, secondary_buffer) =
             win32_init_dsound(window_handle, &mut sound_output)?;
 
-        // note(aalhendi): hack to copy buffer_size. we cant borrow immutable from mutable... should be handled by compiler
-        let initial_bytes_to_write =
-            sound_output.latency_sample_count * sound_output.bytes_per_sample;
-        win32_fill_sound_buffer(
-            &secondary_buffer,
-            &mut sound_output,
-            0,
-            initial_bytes_to_write,
-        )?;
+        win32_clear_sound_buffer(&secondary_buffer, &mut sound_output)?;
         secondary_buffer.Play(0, 0, DSBPLAY_LOOPING)?;
+
+        GLOBAL_RUNNING = true;
+
+        // TODO(aalhendi): pool with bitmap VirtualAlloc
+        let samples = VirtualAlloc(
+            None,
+            sound_output.buffer_size as usize,
+            MEM_RESERVE | MEM_COMMIT,
+            PAGE_READWRITE,
+        ) as *mut i16;
 
         let mut last_counter = 0;
         QueryPerformanceCounter(&mut last_counter)?;
         // TODO(aalhendi): do we want to use rdtscp instead?
         let mut last_cycle_count = _rdtsc();
 
-        GLOBAL_RUNNING = true;
         while GLOBAL_RUNNING {
             let mut message = MSG::default();
             while PeekMessageA(&mut message, None, 0, 0, PM_REMOVE).as_bool() {
@@ -514,47 +554,79 @@ fn main() -> Result<()> {
                 },
             );
 
-            GLOBAL_BACKBUFFER.render_weird_gradient(x_offset, y_offset);
-
-            // NOTE(aalhendi): direct sound test
             // offset, in bytes, of the play cursor
             let mut play_cursor = 0u32;
             // offset, in bytes, of the write cursor
             let mut write_cursor = 0u32;
-            secondary_buffer.GetCurrentPosition(Some(&mut play_cursor), Some(&mut write_cursor))?;
+            let mut is_sound_valid = false;
+            let mut bytes_to_lock = 0u32;
+            let mut bytes_to_write = 0u32;
+            // TODO(aalhendi): tighten up sound logic so that we know where we should be writing to and we can anticipate the time spent in the game update
+            match secondary_buffer
+                .GetCurrentPosition(Some(&mut play_cursor), Some(&mut write_cursor))
+            {
+                Ok(_) => {
+                    // lock offset
+                    bytes_to_lock = sound_output
+                        .running_sample_index
+                        .overflowing_mul(sound_output.bytes_per_sample)
+                        .0
+                        % sound_output.buffer_size;
 
-            // lock offset
-            let bytes_to_lock = sound_output
-                .running_sample_index
-                .overflowing_mul(sound_output.bytes_per_sample)
-                .0
-                % sound_output.buffer_size;
+                    // lock size
+                    let target_write_cursor = (play_cursor
+                        + (sound_output.latency_sample_count * sound_output.bytes_per_sample))
+                        % sound_output.buffer_size;
+                    bytes_to_write = if bytes_to_lock > target_write_cursor {
+                        // case 1: we are wrapping around the ring buffer, fill 2 regions
+                        (sound_output.buffer_size - bytes_to_lock) + target_write_cursor
+                    } else {
+                        // case 2: we are not wrapping around the ring buffer, fill 1 region
+                        target_write_cursor - bytes_to_lock
+                    };
 
-            // lock size
-            let target_write_cursor = (play_cursor
-                + (sound_output.latency_sample_count * sound_output.bytes_per_sample))
-                % sound_output.buffer_size;
-            // TODO(aalhendi): change to lower latency offset from the play cursor when we actually start having sound effects
-            let bytes_to_write = if bytes_to_lock > target_write_cursor {
-                // case 1: we are wrapping around the ring buffer, fill 2 regions
-                (sound_output.buffer_size - bytes_to_lock) + target_write_cursor
-            } else {
-                // case 2: we are not wrapping around the ring buffer, fill 1 region
-                target_write_cursor - bytes_to_lock
+                    is_sound_valid = true
+                }
+                Err(e) => println!("Error getting sound position: {e:?}"),
+            }
+
+            let mut sound_buffer = GameSoundOutputBuffer {
+                samples_per_second: sound_output.samples_per_second,
+                sample_count: bytes_to_write / sound_output.bytes_per_sample,
+                samples,
             };
 
-            // NOTE(aalhendi): ideally, we want to only fill sound buffer if there's something to write.
-            // this fn calls Lock(), which can fail if bytes_to_write is 0
-            // we are ignoring the error for now, skipping this frame if it fails. This is to match C behavior.
-            // from testing, this only happens the first time call occurs. we could have a if check to see if bytes_to_write is 0
-            // but that check would run every frame, which is not ideal.
-            if let Err(e) = win32_fill_sound_buffer(
-                &secondary_buffer,
-                &mut sound_output,
-                bytes_to_lock,
-                bytes_to_write,
-            ) {
-                println!("Error filling sound buffer: {e:?}");
+            let mut buffer = GameOffscreenBuffer {
+                width: GLOBAL_BACKBUFFER.width,
+                height: GLOBAL_BACKBUFFER.height,
+                pitch: GLOBAL_BACKBUFFER.pitch,
+                memory: GLOBAL_BACKBUFFER.memory,
+            };
+
+            game_update_and_render(
+                &mut buffer,
+                x_offset,
+                y_offset,
+                &mut sound_buffer,
+                sound_output.tone_hz,
+            );
+
+            // NOTE(aalhendi): direct sound test
+            if is_sound_valid {
+                // NOTE(aalhendi): ideally, we want to only fill sound buffer if there's something to write.
+                // this fn calls Lock(), which can fail if bytes_to_write is 0
+                // we are ignoring the error for now, skipping this frame if it fails. This is to match C behavior.
+                // from testing, this only happens the first time call occurs. we could have a if check to see if bytes_to_write is 0
+                // but that check would run every frame, which is not ideal.
+                if let Err(e) = win32_fill_sound_buffer(
+                    &secondary_buffer,
+                    &mut sound_output,
+                    bytes_to_lock,
+                    bytes_to_write,
+                    &mut sound_buffer,
+                ) {
+                    println!("Error filling sound buffer: {e:?}");
+                }
             }
 
             let dims = Win32WindowDimension::from(window_handle);

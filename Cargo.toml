@@ -25,3 +25,7 @@ features = [
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_Media_Audio_DirectSound",
 ]
+
+[lib]
+name = "hm"
+path = "src/lib.rs"
