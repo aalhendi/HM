@@ -27,12 +27,12 @@ use windows::{
                     VK_RIGHT, VK_S, VK_SPACE, VK_UP, VK_W,
                 },
                 XboxController::{
-                    XINPUT_GAMEPAD_A, XINPUT_GAMEPAD_B, XINPUT_GAMEPAD_BACK,
+                    XINPUT_GAMEPAD_A, XINPUT_GAMEPAD_B, XINPUT_GAMEPAD_BUTTON_FLAGS,
                     XINPUT_GAMEPAD_DPAD_DOWN, XINPUT_GAMEPAD_DPAD_LEFT, XINPUT_GAMEPAD_DPAD_RIGHT,
                     XINPUT_GAMEPAD_DPAD_UP, XINPUT_GAMEPAD_LEFT_SHOULDER,
                     XINPUT_GAMEPAD_LEFT_THUMB, XINPUT_GAMEPAD_RIGHT_SHOULDER,
-                    XINPUT_GAMEPAD_RIGHT_THUMB, XINPUT_GAMEPAD_START, XINPUT_GAMEPAD_X,
-                    XINPUT_GAMEPAD_Y, XINPUT_STATE, XInputGetState, XUSER_MAX_COUNT,
+                    XINPUT_GAMEPAD_RIGHT_THUMB, XINPUT_GAMEPAD_X, XINPUT_GAMEPAD_Y, XINPUT_STATE,
+                    XInputGetState, XUSER_MAX_COUNT,
                 },
             },
             WindowsAndMessaging::*,
@@ -41,7 +41,10 @@ use windows::{
     core::*,
 };
 
-use hm::{GameOffscreenBuffer, GameSoundOutputBuffer, game_update_and_render};
+use hm::{
+    GameButton, GameButtonState, GameInput, GameOffscreenBuffer, GameSoundOutputBuffer,
+    game_update_and_render,
+};
 
 /* TODO(aalhendi): THIS IS NOT A FINAL PLATFORM LAYER!!!
 
@@ -157,23 +160,19 @@ fn win32_init_dsound(
 
 struct Win32SoundOutput {
     samples_per_second: u32,
-    tone_hz: u32,
     running_sample_index: u32,
-    wave_period: u32,
     bytes_per_sample: u32,
     buffer_size: u32,
     latency_sample_count: u32,
 }
 
 impl Win32SoundOutput {
-    fn new(samples_per_second: u32, tone_hz: u32) -> Self {
+    fn new(samples_per_second: u32) -> Self {
         let bytes_per_sample = size_of::<i16>() as u32 * 2;
 
         Self {
             samples_per_second,
-            tone_hz,
             running_sample_index: 0,
-            wave_period: samples_per_second / tone_hz,
             bytes_per_sample,
             buffer_size: samples_per_second * bytes_per_sample, // 2 channels, 2 bytes per sample
             latency_sample_count: samples_per_second / 15,
@@ -306,6 +305,20 @@ fn win32_fill_sound_buffer(
             final_size_region2,
         )
     }
+}
+
+fn win32_process_x_input_digital_button(
+    x_input_button_state: XINPUT_GAMEPAD_BUTTON_FLAGS,
+    old_state: &mut GameButtonState,
+    button_bit: XINPUT_GAMEPAD_BUTTON_FLAGS,
+    new_state: &mut GameButtonState,
+) {
+    new_state.ended_down = (x_input_button_state & button_bit) == button_bit;
+    new_state.half_transition_count = if old_state.ended_down != new_state.ended_down {
+        1
+    } else {
+        0
+    };
 }
 
 struct Win32WindowDimension {
@@ -458,13 +471,9 @@ fn main() -> Result<()> {
         // NOTE(aalhendi): By using CS_OWNDC, can get one device context and keep using it forever since it is not shared.
         let device_context = GetDC(Some(window_handle));
 
-        // NOTE(aalhendi): Graphics test
-        let mut x_offset = 0;
-        let mut y_offset = 0;
-
         // NOTE(aalhendi): Audio test
         // TODO(aalhendi): make this sixty seconds?
-        let mut sound_output = Win32SoundOutput::new(48000, 256);
+        let mut sound_output = Win32SoundOutput::new(48000);
 
         // cant load direct sound till we have a window handle
         let (_ds, _primary_buffer, secondary_buffer) =
@@ -483,6 +492,13 @@ fn main() -> Result<()> {
             PAGE_READWRITE,
         ) as *mut i16;
 
+        let mut input = [GameInput::default(), GameInput::default()];
+        // NOTE(aalhendi): this is a hack to get around the fact that we cant have 2 mutable references to the same array
+        let (new_input_slice, old_input_slice) = input.split_at_mut(1);
+
+        let mut new_input = &mut new_input_slice[0];
+        let mut old_input = &mut old_input_slice[0];
+
         let mut last_counter = 0;
         QueryPerformanceCounter(&mut last_counter)?;
         // TODO(aalhendi): do we want to use rdtscp instead?
@@ -500,7 +516,14 @@ fn main() -> Result<()> {
             }
 
             // TODO(aalhendi): should we poll this more frequently?
-            for controller_index in 0..XUSER_MAX_COUNT {
+            let mut max_controller_count = XUSER_MAX_COUNT;
+            if max_controller_count as usize > new_input.controllers.len() {
+                max_controller_count = new_input.controllers.len() as u32;
+            }
+            for controller_index in 0..max_controller_count {
+                let old_controller = &mut old_input.controllers[controller_index as usize];
+                let new_controller = &mut new_input.controllers[controller_index as usize];
+
                 let mut controller_state: XINPUT_STATE = XINPUT_STATE::default();
                 let x_input_state_res = XInputGetState(controller_index, &mut controller_state);
                 if x_input_state_res == ERROR_SUCCESS.0 {
@@ -508,38 +531,96 @@ fn main() -> Result<()> {
                     // TODO(aalhendi): see if controller_state.dwPacketNumber increments too rapidly
                     let pad = &controller_state.Gamepad;
 
+                    // TODO(aalhendi): DPad
                     let _up = pad.wButtons & XINPUT_GAMEPAD_DPAD_UP;
                     let _down = pad.wButtons & XINPUT_GAMEPAD_DPAD_DOWN;
                     let _left = pad.wButtons & XINPUT_GAMEPAD_DPAD_LEFT;
                     let _right = pad.wButtons & XINPUT_GAMEPAD_DPAD_RIGHT;
-                    let _start = pad.wButtons & XINPUT_GAMEPAD_START;
-                    let _back = pad.wButtons & XINPUT_GAMEPAD_BACK;
+
+                    // let _start = pad.wButtons & XINPUT_GAMEPAD_START;
+                    // let _back = pad.wButtons & XINPUT_GAMEPAD_BACK;
+
                     let _left_thumb = pad.wButtons & XINPUT_GAMEPAD_LEFT_THUMB;
                     let _right_thumb = pad.wButtons & XINPUT_GAMEPAD_RIGHT_THUMB;
                     let _left_shoulder = pad.wButtons & XINPUT_GAMEPAD_LEFT_SHOULDER;
                     let _right_shoulder = pad.wButtons & XINPUT_GAMEPAD_RIGHT_SHOULDER;
+
                     let _a_button = pad.wButtons & XINPUT_GAMEPAD_A;
                     let _b_button = pad.wButtons & XINPUT_GAMEPAD_B;
                     let _x_button = pad.wButtons & XINPUT_GAMEPAD_X;
                     let _y_button = pad.wButtons & XINPUT_GAMEPAD_Y;
 
-                    let stick_left_x = pad.sThumbLX;
-                    let stick_left_y = pad.sThumbLY;
+                    new_controller.is_analog = true;
+                    new_controller.left_stick_x_start = old_controller.left_stick_x_end;
+                    new_controller.left_stick_y_start = old_controller.left_stick_y_end;
+
+                    // TODO(aalhendi): collapse to single function
+                    let stick_left_x = match (pad.sThumbLX).cmp(&0) {
+                        std::cmp::Ordering::Less => pad.sThumbLX as f32 / 32768_f32,
+                        std::cmp::Ordering::Equal => 0_f32,
+                        std::cmp::Ordering::Greater => pad.sThumbLX as f32 / 32767_f32,
+                    };
+
+                    new_controller.left_stick_x_min = stick_left_x;
+                    new_controller.left_stick_x_max = stick_left_x;
+                    new_controller.left_stick_x_end = stick_left_x;
+
+                    let stick_left_y = match (pad.sThumbLY).cmp(&0) {
+                        std::cmp::Ordering::Less => pad.sThumbLY as f32 / 32768_f32,
+                        std::cmp::Ordering::Equal => 0_f32,
+                        std::cmp::Ordering::Greater => pad.sThumbLY as f32 / 32767_f32,
+                    };
+
+                    new_controller.left_stick_y_min = stick_left_y;
+                    new_controller.left_stick_y_max = stick_left_y;
+                    new_controller.left_stick_y_end = stick_left_y;
+
                     let _stick_right_x = pad.sThumbRX;
                     let _stick_right_y = pad.sThumbRY;
 
                     // NOTE(aalhendi): we will do deadzone handling later using XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE 8689
-                    x_offset += (stick_left_x as i32) / 4096;
-                    y_offset += (stick_left_y as i32) / 4096;
 
-                    sound_output.tone_hz =
-                        (512_i32 + ((256_f32 * (stick_left_y as f32 / 30_000_f32)) as i32)) as u32;
-                    // NOTE(aalhendi): could be done neater by splitting into offset and base.
-                    // also could have used clamp to prevent division by zero
-                    // let tone_offset = (256_f32 * (stick_left_y as f32 / 30_000_f32)) as i32;
-                    // sound_output.tone_hz = (512 + tone_offset).clamp(100, 2000) as u32;
-                    sound_output.wave_period =
-                        sound_output.samples_per_second / sound_output.tone_hz;
+                    win32_process_x_input_digital_button(
+                        pad.wButtons,
+                        old_controller.button_mut(GameButton::Down),
+                        XINPUT_GAMEPAD_A,
+                        new_controller.button_mut(GameButton::Down),
+                    );
+
+                    win32_process_x_input_digital_button(
+                        pad.wButtons,
+                        old_controller.button_mut(GameButton::Right),
+                        XINPUT_GAMEPAD_B,
+                        new_controller.button_mut(GameButton::Right),
+                    );
+
+                    win32_process_x_input_digital_button(
+                        pad.wButtons,
+                        old_controller.button_mut(GameButton::Left),
+                        XINPUT_GAMEPAD_X,
+                        new_controller.button_mut(GameButton::Left),
+                    );
+
+                    win32_process_x_input_digital_button(
+                        pad.wButtons,
+                        old_controller.button_mut(GameButton::Up),
+                        XINPUT_GAMEPAD_Y,
+                        new_controller.button_mut(GameButton::Up),
+                    );
+
+                    win32_process_x_input_digital_button(
+                        pad.wButtons,
+                        old_controller.button_mut(GameButton::LeftShoulder),
+                        XINPUT_GAMEPAD_LEFT_SHOULDER,
+                        new_controller.button_mut(GameButton::LeftShoulder),
+                    );
+
+                    win32_process_x_input_digital_button(
+                        pad.wButtons,
+                        old_controller.button_mut(GameButton::RightShoulder),
+                        XINPUT_GAMEPAD_RIGHT_SHOULDER,
+                        new_controller.button_mut(GameButton::RightShoulder),
+                    );
                 } else {
                     // NOTE(aalhendi): This controller is not available
                 }
@@ -603,13 +684,7 @@ fn main() -> Result<()> {
                 memory: GLOBAL_BACKBUFFER.memory,
             };
 
-            game_update_and_render(
-                &mut buffer,
-                x_offset,
-                y_offset,
-                &mut sound_buffer,
-                sound_output.tone_hz,
-            );
+            game_update_and_render(new_input, &mut buffer, &mut sound_buffer);
 
             // NOTE(aalhendi): direct sound test
             if is_sound_valid {
@@ -647,6 +722,9 @@ fn main() -> Result<()> {
             );
             last_counter = end_counter;
             last_cycle_count = end_cycle_count;
+
+            std::mem::swap(&mut new_input, &mut old_input);
+            // TODO(aalhendi): should i clear these here?
         }
 
         Ok(())
