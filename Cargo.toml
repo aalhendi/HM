@@ -29,3 +29,8 @@ features = [
 [lib]
 name = "hm"
 path = "src/lib.rs"
+
+[features]
+internal_build = []
+
+default = ["internal_build"]

@@ -2,6 +2,25 @@
 
 // NOTE(aalhendi): Services that the game provides to the platform layer
 
+/// Converts megabytes to bytes.
+#[inline(always)]
+pub const fn megabytes_to_bytes(megabytes: usize) -> usize {
+    megabytes * 1024 * 1024
+}
+
+/// Converts gigabytes to bytes.
+#[inline(always)]
+pub const fn gigabytes_to_bytes(gigabytes: usize) -> usize {
+    gigabytes * 1024 * 1024 * 1024
+}
+
+#[cfg(feature = "internal_build")]
+/// Converts terabytes to bytes.
+#[inline(always)]
+pub const fn terabytes_to_bytes(terabytes: usize) -> usize {
+    terabytes * 1024 * 1024 * 1024 * 1024
+}
+
 pub struct GameOffscreenBuffer {
     // NOTE(aalhendi): pixels are always 32-bits wide, Memory Order BB GG RR XX
     // NOTE(aalhendi): void* to avoid specifying the type, we want windows to give us back a ptr to the bitmap memory
@@ -66,6 +85,7 @@ impl GameControllerInput {
 
 #[derive(Default)]
 pub struct GameInput {
+    // TODO(aalhendi): insert clock values here.
     pub controllers: [GameControllerInput; 4],
 }
 
@@ -73,6 +93,24 @@ pub struct GameInput {
 pub struct GameButtonState {
     pub half_transition_count: u32,
     pub ended_down: bool,
+}
+
+#[derive(Default)]
+pub struct GameMemory {
+    pub is_initialized: bool,
+    pub permanent_storage_size: usize,
+    // NOTE(aalhendi): REQUIRED to be cleared to 0 at startup
+    pub permanent_storage: *mut (),
+    pub transient_storage_size: usize,
+    // NOTE(aalhendi): REQUIRED to be cleared to 0 at startup
+    pub transient_storage: *mut (),
+}
+
+#[derive(Default)]
+pub struct GameState {
+    pub tone_hz: u32,
+    pub blue_offset: i32,
+    pub green_offset: i32,
 }
 
 impl GameSoundOutputBuffer {
@@ -110,33 +148,45 @@ impl GameSoundOutputBuffer {
 }
 
 pub fn game_update_and_render(
+    memory: &mut GameMemory,
     input: &mut GameInput,
     buffer: &mut GameOffscreenBuffer,
     sound_buffer: &mut GameSoundOutputBuffer,
 ) {
-    unsafe {
-        static mut BLUE_OFFSET: i32 = 0;
-        static mut GREEN_OFFSET: i32 = 0;
-        static mut TONE_HZ: u32 = 256; // Hz
+    debug_assert!(
+        std::mem::size_of::<GameState>() <= memory.permanent_storage_size,
+        "GameState is too large for permanent storage"
+    );
 
-        let input_0 = &mut input.controllers[0];
+    let game_state = unsafe { &mut *memory.permanent_storage.cast::<GameState>() };
 
-        if input_0.is_analog {
-            // NOTE(aalhendi): use analog tuning
-            BLUE_OFFSET += (4.0_f32 * input_0.left_stick_x_end) as i32;
-            TONE_HZ = 256 + (128_f32 * input_0.left_stick_y_end) as u32;
-        } else {
-            // NOTE(aalhendi): use digital tuning
-        }
+    if !memory.is_initialized {
+        game_state.tone_hz = 256;
+        // NOTE(aalhendi): these are not needed because they are cleared to 0 at startup by requirement!
+        // game_state.blue_offset = 0;
+        // game_state.green_offset = 0;
 
-        if input_0.button(GameButton::Down).ended_down {
-            GREEN_OFFSET += 1;
-        }
-
-        // TODO(aalhendi): allow sample offsets here for more robust platform options
-        sound_buffer.game_output_sound(TONE_HZ);
-        buffer.render_weird_gradient(BLUE_OFFSET, GREEN_OFFSET);
+        // TODO(aalhendi): this may be more appropriate in to do in the platform layer
+        memory.is_initialized = true;
     }
+
+    let input_0 = &mut input.controllers[0];
+
+    if input_0.is_analog {
+        // NOTE(aalhendi): use analog tuning
+        game_state.blue_offset += (4.0_f32 * input_0.left_stick_x_end) as i32;
+        game_state.tone_hz = 256 + (128_f32 * input_0.left_stick_y_end) as u32;
+    } else {
+        // NOTE(aalhendi): use digital tuning
+    }
+
+    if input_0.button(GameButton::Down).ended_down {
+        game_state.green_offset += 1;
+    }
+
+    // TODO(aalhendi): allow sample offsets here for more robust platform options
+    sound_buffer.game_output_sound(game_state.tone_hz);
+    buffer.render_weird_gradient(game_state.blue_offset, game_state.green_offset);
 }
 
 impl GameOffscreenBuffer {

@@ -42,8 +42,8 @@ use windows::{
 };
 
 use hm::{
-    GameButton, GameButtonState, GameInput, GameOffscreenBuffer, GameSoundOutputBuffer,
-    game_update_and_render,
+    GameButton, GameButtonState, GameInput, GameMemory, GameOffscreenBuffer, GameSoundOutputBuffer,
+    game_update_and_render, gigabytes_to_bytes, megabytes_to_bytes,
 };
 
 /* TODO(aalhendi): THIS IS NOT A FINAL PLATFORM LAYER!!!
@@ -492,6 +492,46 @@ fn main() -> Result<()> {
             PAGE_READWRITE,
         ) as *mut i16;
 
+        let permanent_storage_size = megabytes_to_bytes(64);
+        let transient_storage_size = gigabytes_to_bytes(4);
+        let total_storage_size = permanent_storage_size + transient_storage_size;
+        let base_address = {
+            #[cfg(feature = "internal_build")]
+            {
+                use hm::terabytes_to_bytes;
+                terabytes_to_bytes(2)
+            }
+            #[cfg(not(feature = "internal_build"))]
+            {
+                0_usize
+            }
+        };
+
+        let permanent_storage = VirtualAlloc(
+            Some(base_address as *mut std::ffi::c_void),
+            total_storage_size,
+            MEM_RESERVE | MEM_COMMIT,
+            PAGE_READWRITE,
+        ) as *mut ();
+
+        let mut game_memory = GameMemory {
+            is_initialized: false,
+            permanent_storage_size,
+            transient_storage_size,
+            permanent_storage,
+            transient_storage: permanent_storage
+                .cast::<u8>()
+                .add(permanent_storage_size)
+                .cast::<()>(),
+        };
+
+        if samples.is_null()
+            || game_memory.permanent_storage.is_null()
+            || game_memory.transient_storage.is_null()
+        {
+            panic!("Failed to allocate samples or permanent storage");
+        }
+
         let mut input = [GameInput::default(), GameInput::default()];
         // NOTE(aalhendi): this is a hack to get around the fact that we cant have 2 mutable references to the same array
         let (new_input_slice, old_input_slice) = input.split_at_mut(1);
@@ -684,7 +724,7 @@ fn main() -> Result<()> {
                 memory: GLOBAL_BACKBUFFER.memory,
             };
 
-            game_update_and_render(new_input, &mut buffer, &mut sound_buffer);
+            game_update_and_render(&mut game_memory, new_input, &mut buffer, &mut sound_buffer);
 
             // NOTE(aalhendi): direct sound test
             if is_sound_valid {
