@@ -1,6 +1,6 @@
 #![allow(static_mut_refs)]
 
-use std::{arch::x86_64::_rdtsc, mem::size_of, ptr};
+use core::{arch::x86_64, cmp, ffi, mem, ptr};
 
 use windows::{
     Win32::{
@@ -73,7 +73,7 @@ const KEY_MESSAGE_IS_ALT_BIT: i32 = 29;
 // TODO(aalhendi): This is a global for now.
 static mut GLOBAL_RUNNING: bool = false;
 static mut GLOBAL_BACKBUFFER: Win32OffscreenBuffer = Win32OffscreenBuffer {
-    info: unsafe { core::mem::zeroed() }, // alloc'ed in win32_resize_dib_section, called v.early in main fn
+    info: unsafe { mem::zeroed() }, // alloc'ed in win32_resize_dib_section, called v.early in main fn
     memory: ptr::null_mut(),
     width: 0,
     height: 0,
@@ -107,7 +107,7 @@ fn win32_init_dsound(
         dwBufferBytes: 0,
         dwReserved: 0,
         // NOTE(aalhendi): we actually can't set the format here, we have to set it later via SetFormat. Windows!
-        lpwfxFormat: std::ptr::null_mut(),
+        lpwfxFormat: ptr::null_mut(),
         guid3DAlgorithm: GUID::zeroed(),
     };
 
@@ -185,9 +185,9 @@ fn win32_clear_sound_buffer(
     sound_output: &mut Win32SoundOutput,
 ) -> windows::core::Result<()> {
     // To be filled by Lock:
-    let mut region1_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+    let mut region1_ptr: *mut ffi::c_void = ptr::null_mut();
     let mut region1_size: u32 = 0;
-    let mut region2_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+    let mut region2_ptr: *mut ffi::c_void = ptr::null_mut();
     let mut region2_size: u32 = 0;
     unsafe {
         secondary_buffer.Lock(
@@ -234,9 +234,9 @@ fn win32_fill_sound_buffer(
     source_buffer: &mut GameSoundOutputBuffer,
 ) -> windows::core::Result<()> {
     // To be filled by Lock:
-    let mut region1_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+    let mut region1_ptr: *mut ffi::c_void = ptr::null_mut();
     let mut region1_size: u32 = 0;
-    let mut region2_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+    let mut region2_ptr: *mut ffi::c_void = ptr::null_mut();
     let mut region2_size: u32 = 0;
 
     unsafe {
@@ -294,12 +294,12 @@ fn win32_fill_sound_buffer(
     let (final_ptr_region2, final_size_region2) = if region2_ptr.is_null() {
         (None, 0)
     } else {
-        (Some(region2_ptr as *const std::ffi::c_void), region2_size)
+        (Some(region2_ptr as *const ffi::c_void), region2_size)
     };
 
     unsafe {
         secondary_buffer.Unlock(
-            region1_ptr as *const std::ffi::c_void,
+            region1_ptr as *const ffi::c_void,
             region1_size,
             final_ptr_region2,
             final_size_region2,
@@ -347,7 +347,7 @@ struct Win32OffscreenBuffer {
     //  windows doesn't know (on the API lvl), what sort of flags, and therefore what kind of memory we want.
     //  CreateDIBSection also can't haveThe fn can only have one signature, it cant get a u8ptr OR a u64 ptr etc. so we pass a void* and cast appropriately
     //  it is used as a double ptr because we give windows an addr of a ptr which we want it to OVERWRITE into a NEW PTR which would point to where it alloc'd mem
-    memory: *mut std::ffi::c_void,
+    memory: *mut ffi::c_void,
     // NOTE(aalhendi): We store width and height in self.info.bmiHeader. This is redundant. Keeping because its only 8 bytes
     width: i32,
     height: i32,
@@ -379,7 +379,7 @@ impl Win32OffscreenBuffer {
 
     /// Resize or Initialize a Device Independent Bitmap (DIB)
     unsafe fn win32_resize_dib_section(&mut self, width: i32, height: i32) {
-        if self.memory != unsafe { core::mem::zeroed() } {
+        if self.memory != unsafe { mem::zeroed() } {
             let free_res = unsafe { VirtualFree(self.memory, 0, MEM_RELEASE) };
             if let Err(e) = free_res {
                 panic!("{e}");
@@ -494,6 +494,7 @@ fn main() -> Result<()> {
 
         let permanent_storage_size = megabytes_to_bytes(64);
         let transient_storage_size = gigabytes_to_bytes(4);
+        // TODO(aalhendi): handle various memory footprints (USING SYSTEM METRICS)
         let total_storage_size = permanent_storage_size + transient_storage_size;
         let base_address = {
             #[cfg(feature = "internal_build")]
@@ -508,7 +509,7 @@ fn main() -> Result<()> {
         };
 
         let permanent_storage = VirtualAlloc(
-            Some(base_address as *mut std::ffi::c_void),
+            Some(base_address as *mut ffi::c_void),
             total_storage_size,
             MEM_RESERVE | MEM_COMMIT,
             PAGE_READWRITE,
@@ -542,7 +543,7 @@ fn main() -> Result<()> {
         let mut last_counter = 0;
         QueryPerformanceCounter(&mut last_counter)?;
         // TODO(aalhendi): do we want to use rdtscp instead?
-        let mut last_cycle_count = _rdtsc();
+        let mut last_cycle_count = x86_64::_rdtsc();
 
         while GLOBAL_RUNNING {
             let mut message = MSG::default();
@@ -596,9 +597,9 @@ fn main() -> Result<()> {
 
                     // TODO(aalhendi): collapse to single function
                     let stick_left_x = match (pad.sThumbLX).cmp(&0) {
-                        std::cmp::Ordering::Less => pad.sThumbLX as f32 / 32768_f32,
-                        std::cmp::Ordering::Equal => 0_f32,
-                        std::cmp::Ordering::Greater => pad.sThumbLX as f32 / 32767_f32,
+                        cmp::Ordering::Less => pad.sThumbLX as f32 / 32768_f32,
+                        cmp::Ordering::Equal => 0_f32,
+                        cmp::Ordering::Greater => pad.sThumbLX as f32 / 32767_f32,
                     };
 
                     new_controller.left_stick_x_min = stick_left_x;
@@ -606,9 +607,9 @@ fn main() -> Result<()> {
                     new_controller.left_stick_x_end = stick_left_x;
 
                     let stick_left_y = match (pad.sThumbLY).cmp(&0) {
-                        std::cmp::Ordering::Less => pad.sThumbLY as f32 / 32768_f32,
-                        std::cmp::Ordering::Equal => 0_f32,
-                        std::cmp::Ordering::Greater => pad.sThumbLY as f32 / 32767_f32,
+                        cmp::Ordering::Less => pad.sThumbLY as f32 / 32768_f32,
+                        cmp::Ordering::Equal => 0_f32,
+                        cmp::Ordering::Greater => pad.sThumbLY as f32 / 32767_f32,
                     };
 
                     new_controller.left_stick_y_min = stick_left_y;
@@ -747,7 +748,7 @@ fn main() -> Result<()> {
             let dims = Win32WindowDimension::from(window_handle);
             GLOBAL_BACKBUFFER.win32_copy_buffer_to_window(device_context, dims.width, dims.height);
 
-            let end_cycle_count = _rdtsc();
+            let end_cycle_count = x86_64::_rdtsc();
 
             let mut end_counter = 0;
             QueryPerformanceCounter(&mut end_counter)?;
@@ -763,7 +764,7 @@ fn main() -> Result<()> {
             last_counter = end_counter;
             last_cycle_count = end_cycle_count;
 
-            std::mem::swap(&mut new_input, &mut old_input);
+            mem::swap(&mut new_input, &mut old_input);
             // TODO(aalhendi): should i clear these here?
         }
 

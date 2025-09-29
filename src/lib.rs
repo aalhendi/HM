@@ -1,6 +1,138 @@
-// TODO(aalhendi): Services that the platform layer provides to the game
+// NOTE(aalhendi): Services that the platform layer provides to the game
+
+#[cfg(feature = "internal_build")]
+/// # Safety
+/// TODO(aalhendi): idk. write this up
+pub unsafe fn debug_platform_free_file_memory(ptr: *mut core::ffi::c_void) {
+    unsafe {
+        use windows::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
+        if !ptr.is_null() {
+            // TODO(aalhendi): hanlde the result
+            let _ = VirtualFree(ptr, 0, MEM_RELEASE);
+        } else {
+            eprintln!("Failed to free file memory: ptr is null");
+        }
+    }
+}
+
+#[cfg(feature = "internal_build")]
+pub fn debug_platform_write_entire_file(
+    filename: PCSTR,
+    memory: &[u8],
+) -> windows::core::Result<()> {
+    unsafe {
+        use windows::Win32::{
+            Foundation::{CloseHandle, GENERIC_WRITE},
+            Storage::FileSystem::{
+                CREATE_ALWAYS, CreateFileA, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_NONE, WriteFile,
+            },
+        };
+
+        let file_handle = CreateFileA(
+            filename,
+            GENERIC_WRITE.0,
+            FILE_SHARE_NONE,
+            None,
+            CREATE_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL,
+            None,
+        )?;
+
+        let mut bytes_written = 0_u32;
+        let write_result = WriteFile(file_handle, Some(memory), Some(&mut bytes_written), None);
+        if write_result.is_err() || bytes_written as usize != memory.len() {
+            eprintln!("Failed to write file: {write_result:?}");
+        }
+
+        // NOTE(aalhendi): we COULD have a RAII guard for the file handle, but it's not worth the complexity.
+        // where we impl Drop for FileHandleGuard, and we closethe handle in the drop.
+        // so for now we just close it manually.
+        // TODO(aalhendi): handle the result
+        let _ = CloseHandle(file_handle);
+        Ok(())
+    }
+}
+
+#[cfg(feature = "internal_build")]
+pub struct DebugPlatformReadFileResult {
+    pub memory: *mut core::ffi::c_void,
+    // NOTE(aalhendi): we are limited to u32 because of the Windows API... Its debug anyway.
+    pub size: u32,
+}
+
+#[cfg(feature = "internal_build")]
+pub fn debug_platform_read_entire_file(
+    filename: PCSTR,
+) -> windows::core::Result<DebugPlatformReadFileResult> {
+    unsafe {
+        use windows::Win32::{
+            Foundation::{CloseHandle, GENERIC_READ},
+            Storage::FileSystem::{
+                CreateFileA, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, GetFileSizeEx, OPEN_EXISTING,
+                ReadFile,
+            },
+            System::Memory::{MEM_COMMIT, PAGE_READWRITE, VirtualAlloc},
+        };
+
+        let file_handle = CreateFileA(
+            filename,
+            GENERIC_READ.0,
+            FILE_SHARE_READ,
+            None,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            None,
+        )?;
+
+        let mut file_size = 0_i64;
+        GetFileSizeEx(file_handle, &mut file_size)?;
+        let file_size_u32 = safe_truncate_i64_to_u32(file_size);
+
+        if file_size == 0 {
+            // NOTE(aalhendi): Reading an empty file isn't an error. We can return null or allocate a 1 byte buffer if caller expects a non-null ptr.
+            // we will return null and let caller handle it.
+            return Ok(DebugPlatformReadFileResult {
+                memory: std::ptr::null_mut(),
+                size: 0,
+            });
+        }
+
+        let mut memory_ptr = VirtualAlloc(None, file_size as usize, MEM_COMMIT, PAGE_READWRITE);
+
+        if memory_ptr.is_null() {
+            eprintln!("Failed to allocate memory for file");
+            return Err(windows::core::Error::from_win32());
+        }
+
+        let buffer = std::slice::from_raw_parts_mut(memory_ptr as *mut u8, file_size_u32 as usize);
+
+        let mut bytes_read = 0_u32;
+        let read_result = ReadFile(file_handle, Some(buffer), Some(&mut bytes_read), None);
+        if read_result.is_err() || bytes_read != file_size_u32 {
+            debug_platform_free_file_memory(memory_ptr);
+            eprintln!("Failed to read file: {read_result:?}");
+            // sound because we just freed the memory
+            memory_ptr = std::ptr::null_mut();
+        }
+
+        // NOTE(aalhendi): we COULD have a RAII guard for the file handle, but it's not worth the complexity.
+        // where we impl Drop for FileHandleGuard, and we closethe handle in the drop.
+        // so for now we just close it manually.
+        // TODO(aalhendi): handle the result
+        let _ = CloseHandle(file_handle);
+        Ok(DebugPlatformReadFileResult {
+            memory: memory_ptr,
+            size: file_size_u32,
+        })
+    }
+}
 
 // NOTE(aalhendi): Services that the game provides to the platform layer
+
+use core::{f32, mem};
+
+#[cfg(feature = "internal_build")]
+use windows::core::PCSTR;
 
 /// Converts megabytes to bytes.
 #[inline(always)]
@@ -21,13 +153,20 @@ pub const fn terabytes_to_bytes(terabytes: usize) -> usize {
     terabytes * 1024 * 1024 * 1024 * 1024
 }
 
+#[cfg(feature = "internal_build")]
+#[inline(always)]
+pub fn safe_truncate_i64_to_u32(value: i64) -> u32 {
+    debug_assert!(value < u32::MAX as i64, "Value is too large");
+    value as u32
+}
+
 pub struct GameOffscreenBuffer {
     // NOTE(aalhendi): pixels are always 32-bits wide, Memory Order BB GG RR XX
     // NOTE(aalhendi): void* to avoid specifying the type, we want windows to give us back a ptr to the bitmap memory
     //  windows doesn't know (on the API lvl), what sort of flags, and therefore what kind of memory we want.
     //  CreateDIBSection also can't haveThe fn can only have one signature, it cant get a u8ptr OR a u64 ptr etc. so we pass a void* and cast appropriately
     //  it is used as a double ptr because we give windows an addr of a ptr which we want it to OVERWRITE into a NEW PTR which would point to where it alloc'd mem
-    pub memory: *mut std::ffi::c_void,
+    pub memory: *mut core::ffi::c_void,
     // NOTE(aalhendi): We store width and height in self.info.bmiHeader. This is redundant. Keeping because its only 8 bytes
     pub width: i32,
     pub height: i32,
@@ -141,7 +280,7 @@ impl GameSoundOutputBuffer {
                 *sample_out = sample_value;
                 sample_out = sample_out.offset(1);
                 // move 1 sample worth forward
-                T_SINE += 2_f32 * std::f32::consts::PI * 1_f32 / wave_period as f32;
+                T_SINE += 2_f32 * f32::consts::PI * 1_f32 / wave_period as f32;
             }
         }
     }
@@ -154,13 +293,33 @@ pub fn game_update_and_render(
     sound_buffer: &mut GameSoundOutputBuffer,
 ) {
     debug_assert!(
-        std::mem::size_of::<GameState>() <= memory.permanent_storage_size,
+        mem::size_of::<GameState>() <= memory.permanent_storage_size,
         "GameState is too large for permanent storage"
     );
 
     let game_state = unsafe { &mut *memory.permanent_storage.cast::<GameState>() };
 
     if !memory.is_initialized {
+        #[cfg(feature = "internal_build")]
+        {
+            let filename = windows::core::s!("src/main.rs");
+            let read_result =
+                debug_platform_read_entire_file(filename).expect("Failed to read file");
+
+            let memory = unsafe {
+                std::slice::from_raw_parts_mut(
+                    read_result.memory as *mut u8,
+                    read_result.size as usize,
+                )
+            };
+            debug_platform_write_entire_file(windows::core::s!("test.out"), memory)
+                .expect("Failed to write file");
+
+            unsafe {
+                debug_platform_free_file_memory(read_result.memory);
+            }
+        }
+
         game_state.tone_hz = 256;
         // NOTE(aalhendi): these are not needed because they are cleared to 0 at startup by requirement!
         // game_state.blue_offset = 0;
