@@ -1,3 +1,5 @@
+#![feature(variant_count)]
+
 // NOTE(aalhendi): Services that the platform layer provides to the game
 
 #[cfg(feature = "internal_build")]
@@ -181,31 +183,34 @@ pub struct GameSoundOutputBuffer {
 
 #[repr(u8)]
 pub enum GameButton {
-    Up = 0,
-    Down,
-    Left,
-    Right,
+    MoveUp = 0,
+    MoveDown,
+    MoveLeft,
+    MoveRight,
+
+    ActionUp,
+    ActionDown,
+    ActionLeft,
+    ActionRight,
+
     RightShoulder,
     LeftShoulder,
+
+    Start,
+    Back,
 }
 
 #[derive(Default)]
 pub struct GameControllerInput {
+    pub is_connected: bool,
     pub is_analog: bool,
 
-    pub left_stick_x_start: f32,
-    pub left_stick_y_start: f32,
+    pub left_stick_average_x: f32,
+    pub left_stick_average_y: f32,
+    pub right_stick_average_x: f32,
+    pub right_stick_average_y: f32,
 
-    pub left_stick_x_min: f32,
-    pub left_stick_y_min: f32,
-
-    pub left_stick_x_max: f32,
-    pub left_stick_y_max: f32,
-
-    pub left_stick_x_end: f32,
-    pub left_stick_y_end: f32,
-
-    pub buttons: [GameButtonState; 6],
+    pub buttons: [GameButtonState; core::mem::variant_count::<GameButton>()],
 }
 
 impl GameControllerInput {
@@ -225,7 +230,7 @@ impl GameControllerInput {
 #[derive(Default)]
 pub struct GameInput {
     // TODO(aalhendi): insert clock values here.
-    pub controllers: [GameControllerInput; 4],
+    pub controllers: [GameControllerInput; 5], // 4 controllers + 1 keyboard
 }
 
 #[derive(Default)]
@@ -329,18 +334,24 @@ pub fn game_update_and_render(
         memory.is_initialized = true;
     }
 
-    let input_0 = &mut input.controllers[0];
+    for controller in input.controllers.iter_mut() {
+        if controller.is_analog {
+            // NOTE(aalhendi): use analog tuning
+            game_state.blue_offset += (4.0_f32 * controller.left_stick_average_x) as i32;
+            game_state.tone_hz = 256 + (128_f32 * controller.left_stick_average_y) as u32;
+        } else {
+            // NOTE(aalhendi): use digital tuning
+            if controller.button(GameButton::MoveLeft).ended_down {
+                game_state.blue_offset -= 1;
+            }
+            if controller.button(GameButton::MoveRight).ended_down {
+                game_state.blue_offset += 1;
+            }
+        }
 
-    if input_0.is_analog {
-        // NOTE(aalhendi): use analog tuning
-        game_state.blue_offset += (4.0_f32 * input_0.left_stick_x_end) as i32;
-        game_state.tone_hz = 256 + (128_f32 * input_0.left_stick_y_end) as u32;
-    } else {
-        // NOTE(aalhendi): use digital tuning
-    }
-
-    if input_0.button(GameButton::Down).ended_down {
-        game_state.green_offset += 1;
+        if controller.button(GameButton::ActionDown).ended_down {
+            game_state.green_offset += 1;
+        }
     }
 
     // TODO(aalhendi): allow sample offsets here for more robust platform options
