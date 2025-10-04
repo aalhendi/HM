@@ -68,7 +68,7 @@ pub fn debug_platform_read_entire_file(
 ) -> windows::core::Result<DebugPlatformReadFileResult> {
     unsafe {
         use windows::Win32::{
-            Foundation::{CloseHandle, GENERIC_READ},
+            Foundation::{CloseHandle, GENERIC_READ, GetLastError},
             Storage::FileSystem::{
                 CreateFileA, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, GetFileSizeEx, OPEN_EXISTING,
                 ReadFile,
@@ -103,7 +103,7 @@ pub fn debug_platform_read_entire_file(
 
         if memory_ptr.is_null() {
             eprintln!("Failed to allocate memory for file");
-            return Err(windows::core::Error::from_win32());
+            return Err(windows::core::Error::from(GetLastError().to_hresult()));
         }
 
         let buffer = std::slice::from_raw_parts_mut(memory_ptr as *mut u8, file_size_u32 as usize);
