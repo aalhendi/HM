@@ -6,12 +6,15 @@ use windows::{
     Win32::{
         Foundation::*,
         Graphics::Gdi::*,
-        Media::Audio::{
-            DirectSound::{
-                DSBCAPS_PRIMARYBUFFER, DSBPLAY_LOOPING, DSBUFFERDESC, DSSCL_PRIORITY,
-                DirectSoundCreate, IDirectSoundBuffer,
+        Media::{
+            Audio::{
+                DirectSound::{
+                    DSBCAPS_PRIMARYBUFFER, DSBPLAY_LOOPING, DSBUFFERDESC, DSSCL_PRIORITY,
+                    DirectSoundCreate, IDirectSoundBuffer,
+                },
+                WAVE_FORMAT_PCM, WAVEFORMATEX,
             },
-            WAVE_FORMAT_PCM, WAVEFORMATEX,
+            TIMERR_NOERROR, timeBeginPeriod,
         },
         System::{
             LibraryLoader::GetModuleHandleA,
@@ -79,6 +82,24 @@ static mut GLOBAL_BACKBUFFER: Win32OffscreenBuffer = Win32OffscreenBuffer {
     height: 0,
     pitch: 0,
 };
+
+static mut PERF_COUNT_FREQUENCY: i64 = 0;
+
+#[inline(always)]
+fn win32_get_wall_clock() -> i64 {
+    let mut perf_count = 0;
+    unsafe {
+        // TODO(aalhendi): handle error
+        QueryPerformanceCounter(&mut perf_count).unwrap();
+        perf_count
+    }
+}
+
+#[inline(always)]
+// NOTE(aalhendi): 32bit? im making this f64 for now.
+fn win32_get_seconds_elapsed(start: i64, end: i64) -> f64 {
+    (end - start) as f64 / unsafe { PERF_COUNT_FREQUENCY } as f64
+}
 
 // NOTE(aalhendi): we return the ds, primary_buffer, secondary_buffer to avoid them being dropped.
 // we're not making them global for now
@@ -445,8 +466,14 @@ fn main() -> Result<()> {
     unsafe {
         let module_handle = GetModuleHandleA(None)?;
 
-        let mut perf_count_frequency = 0;
-        QueryPerformanceFrequency(&mut perf_count_frequency)?;
+        QueryPerformanceFrequency(&mut PERF_COUNT_FREQUENCY)?;
+
+        // NOTE(aalhendi): Set windows scheduler granularity. This is used to make our sleep more accurate (granular).
+        let desired_scheduler_ms = 1;
+        let sleep_is_granular = timeBeginPeriod(desired_scheduler_ms) == TIMERR_NOERROR;
+        if !sleep_is_granular {
+            println!("Sleep is not granular. This is bad.");
+        }
 
         GLOBAL_BACKBUFFER.win32_resize_dib_section(1280, 720);
 
@@ -458,6 +485,11 @@ fn main() -> Result<()> {
             hCursor: LoadCursorW(None, IDC_ARROW)?,
             ..Default::default()
         };
+
+        // TODO(aalhendi): GetSystemMetrics(SM_SAMPLERATE)? How do we reliably query refresh rate? GetComposition?
+        let monitor_refresh_hz = 60_i32;
+        let game_update_hz = monitor_refresh_hz / 2;
+        let target_seconds_per_frame = 1_f64 / game_update_hz as f64;
 
         let atom = RegisterClassA(&wc);
         if atom == 0 {
@@ -560,8 +592,7 @@ fn main() -> Result<()> {
         let mut new_input = &mut new_input_slice[0];
         let mut old_input = &mut old_input_slice[0];
 
-        let mut last_counter = 0;
-        QueryPerformanceCounter(&mut last_counter)?;
+        let mut last_counter = win32_get_wall_clock();
         // TODO(aalhendi): do we want to use rdtscp instead?
         let mut last_cycle_count = x86_64::_rdtsc();
 
@@ -773,6 +804,7 @@ fn main() -> Result<()> {
                 Err(e) => println!("Error getting sound position: {e:?}"),
             }
 
+            // TODO(aalhendi): sound buffer is wrong now because its not updated to work with new frame loop
             let mut sound_buffer = GameSoundOutputBuffer {
                 samples_per_second: sound_output.samples_per_second,
                 sample_count: bytes_to_write / sound_output.bytes_per_sample,
@@ -788,7 +820,6 @@ fn main() -> Result<()> {
 
             game_update_and_render(&mut game_memory, new_input, &mut buffer, &mut sound_buffer);
 
-            // NOTE(aalhendi): direct sound test
             if is_sound_valid {
                 // NOTE(aalhendi): ideally, we want to only fill sound buffer if there's something to write.
                 // this fn calls Lock(), which can fail if bytes_to_write is 0
@@ -806,27 +837,63 @@ fn main() -> Result<()> {
                 }
             }
 
+            // TODO(aalhendi): NOT TESTED YET!
+            let work_counter = win32_get_wall_clock();
+            let work_seconds_elapsed = win32_get_seconds_elapsed(last_counter, work_counter);
+
+            let mut seconds_elapsed_for_frame = work_seconds_elapsed;
+            if seconds_elapsed_for_frame < target_seconds_per_frame {
+                while seconds_elapsed_for_frame < target_seconds_per_frame {
+                    if sleep_is_granular {
+                        let sleep_ms =
+                            (target_seconds_per_frame - seconds_elapsed_for_frame) * 1000_f64;
+                        if sleep_ms > 1_f64 {
+                            // TODO(aalhendi): sleeping is hard... see Intel's TPAUSE instruction. I think AMD uses UMWAIT.
+                            windows::Win32::System::Threading::Sleep(sleep_ms as u32);
+                        }
+                    }
+
+                    #[cfg(feature = "internal_build")]
+                    {
+                        let test_seconds_elapsed_for_frame =
+                            win32_get_seconds_elapsed(last_counter, win32_get_wall_clock());
+                        const FRAME_TIME_SLOP_S: f64 = 0.002;
+                        debug_assert!(
+                            test_seconds_elapsed_for_frame
+                                < target_seconds_per_frame + FRAME_TIME_SLOP_S,
+                            "Test seconds elapsed for frame is greater than target seconds per frame {test_seconds_elapsed_for_frame} > {target_seconds_per_frame}"
+                        );
+                    }
+
+                    seconds_elapsed_for_frame =
+                        win32_get_seconds_elapsed(last_counter, win32_get_wall_clock());
+                }
+            } else {
+                // TODO(aalhendi): handle missed frame
+                println!(
+                    "MISSED TARGET FPS!!! {seconds_elapsed_for_frame} < {target_seconds_per_frame}"
+                );
+            }
+
             let dims = Win32WindowDimension::from(window_handle);
             GLOBAL_BACKBUFFER.win32_copy_buffer_to_window(device_context, dims.width, dims.height);
 
+            mem::swap(&mut new_input, &mut old_input);
+            // TODO(aalhendi): should i clear these here?
+
+            let end_counter = win32_get_wall_clock();
+            let ms_per_frame = 1_000_f64 * win32_get_seconds_elapsed(last_counter, end_counter);
+            last_counter = end_counter;
+
             let end_cycle_count = x86_64::_rdtsc();
-
-            let mut end_counter = 0;
-            QueryPerformanceCounter(&mut end_counter)?;
-
             let cycles_elapsed = end_cycle_count as f64 - last_cycle_count as f64;
-            let counter_elapsed = end_counter as f64 - last_counter as f64;
-            let ms_per_frame = (1_000_f64 * counter_elapsed) / perf_count_frequency as f64;
-            let fps = perf_count_frequency as f64 / counter_elapsed;
+            last_cycle_count = end_cycle_count;
+
+            let fps = 0_f64; // TODO(aalhendi): calculate fps
             println!(
                 "{ms_per_frame:.2} ms/frame - {fps:.1} fps - {mc:.2} mega_cycles/frame",
                 mc = cycles_elapsed as f64 / (1_000_f64 * 1_000_f64)
             );
-            last_counter = end_counter;
-            last_cycle_count = end_cycle_count;
-
-            mem::swap(&mut new_input, &mut old_input);
-            // TODO(aalhendi): should i clear these here?
         }
 
         Ok(())
