@@ -1,6 +1,6 @@
 #![allow(static_mut_refs)]
 
-use core::{arch::x86_64, cmp, ffi, mem, ptr};
+use core::{arch::x86_64, ffi, mem, ptr};
 
 use windows::{
     Win32::{
@@ -330,6 +330,17 @@ fn win32_process_x_input_digital_button(
     };
 }
 
+fn win32_process_x_input_stick_value(value: i16, deadzone_threshold: i16) -> f32 {
+    let dz_f32 = deadzone_threshold as f32;
+    if value < -deadzone_threshold {
+        (value as f32 + dz_f32) / (32768_f32 - dz_f32)
+    } else if value > deadzone_threshold {
+        (value as f32 - dz_f32) / (32767_f32 - dz_f32)
+    } else {
+        0_f32
+    }
+}
+
 struct Win32WindowDimension {
     width: i32,
     height: i32,
@@ -586,23 +597,16 @@ fn main() -> Result<()> {
                     // TODO(aalhendi): see if controller_state.dwPacketNumber increments too rapidly
                     let pad = &controller_state.Gamepad;
 
-                    // TODO(aalhendi): collapse to single function
-                    let stick_left_x =
-                        match (pad.sThumbLX).cmp(&-(XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE.0 as i16)) {
-                            cmp::Ordering::Less => pad.sThumbLX as f32 / 32768_f32,
-                            cmp::Ordering::Equal => 0_f32,
-                            cmp::Ordering::Greater => pad.sThumbLX as f32 / 32767_f32,
-                        };
-
+                    let stick_left_x = win32_process_x_input_stick_value(
+                        pad.sThumbLX,
+                        XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE.0 as i16,
+                    );
                     new_controller.left_stick_average_x = stick_left_x;
 
-                    let stick_left_y =
-                        match (pad.sThumbLY).cmp(&-(XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE.0 as i16)) {
-                            cmp::Ordering::Less => pad.sThumbLY as f32 / 32768_f32,
-                            cmp::Ordering::Equal => 0_f32,
-                            cmp::Ordering::Greater => pad.sThumbLY as f32 / 32767_f32,
-                        };
-
+                    let stick_left_y = win32_process_x_input_stick_value(
+                        pad.sThumbLY,
+                        XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE.0 as i16,
+                    );
                     new_controller.left_stick_average_y = stick_left_y;
 
                     if stick_left_x != 0.0 || stick_left_y != 0.0 {
