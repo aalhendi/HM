@@ -286,6 +286,9 @@ impl GameSoundOutputBuffer {
                 sample_out = sample_out.offset(1);
                 // move 1 sample worth forward
                 T_SINE += 2_f32 * f32::consts::PI * 1_f32 / wave_period as f32;
+                if T_SINE > 2_f32 * f32::consts::PI {
+                    T_SINE -= 2_f32 * f32::consts::PI;
+                }
             }
         }
     }
@@ -295,7 +298,6 @@ pub fn game_update_and_render(
     memory: &mut GameMemory,
     input: &mut GameInput,
     buffer: &mut GameOffscreenBuffer,
-    sound_buffer: &mut GameSoundOutputBuffer,
 ) {
     debug_assert!(
         mem::size_of::<GameState>() <= memory.permanent_storage_size,
@@ -325,7 +327,7 @@ pub fn game_update_and_render(
             }
         }
 
-        game_state.tone_hz = 256;
+        game_state.tone_hz = 512;
         // NOTE(aalhendi): these are not needed because they are cleared to 0 at startup by requirement!
         // game_state.blue_offset = 0;
         // game_state.green_offset = 0;
@@ -338,7 +340,7 @@ pub fn game_update_and_render(
         if controller.is_analog {
             // NOTE(aalhendi): use analog tuning
             game_state.blue_offset += (4.0_f32 * controller.left_stick_average_x) as i32;
-            game_state.tone_hz = 256 + (128_f32 * controller.left_stick_average_y) as u32;
+            game_state.tone_hz = 512 + (128_f32 * controller.left_stick_average_y) as u32;
         } else {
             // NOTE(aalhendi): use digital tuning
             if controller.button(GameButton::MoveLeft).ended_down {
@@ -354,9 +356,15 @@ pub fn game_update_and_render(
         }
     }
 
-    // TODO(aalhendi): allow sample offsets here for more robust platform options
-    sound_buffer.game_output_sound(game_state.tone_hz);
     buffer.render_weird_gradient(game_state.blue_offset, game_state.green_offset);
+}
+
+// NOTE(aalhendi): At the moment, this has to be a very fast function, it cannot be more than a millisecond
+// or so.
+// TODO(aalhendi): reduce the pressure on this function's performance by measuring it or asking about it.
+pub fn game_get_sound_samples(memory: &mut GameMemory, sound_buffer: &mut GameSoundOutputBuffer) {
+    let game_state = unsafe { &mut *memory.permanent_storage.cast::<GameState>() };
+    sound_buffer.game_output_sound(game_state.tone_hz);
 }
 
 impl GameOffscreenBuffer {

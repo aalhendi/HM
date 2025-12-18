@@ -1,11 +1,21 @@
 #![allow(static_mut_refs)]
 
 use core::{arch::x86_64, ffi, mem, ptr};
-
+use hm::{
+    GameButton, GameButtonState, GameControllerInput, GameInput, GameMemory, GameOffscreenBuffer,
+    GameSoundOutputBuffer, game_get_sound_samples, game_update_and_render, gigabytes_to_bytes,
+    megabytes_to_bytes,
+};
+use windows::Win32::Media::Audio::DirectSound::{
+    DSBCAPS_CTRL3D, DSBCAPS_GETCURRENTPOSITION2, DSBCAPS_GLOBALFOCUS,
+};
 use windows::{
     Win32::{
-        Foundation::*,
-        Graphics::Gdi::*,
+        Foundation::{ERROR_SUCCESS, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM},
+        Graphics::Gdi::{
+            BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BeginPaint, DIB_RGB_COLORS, EndPaint, GetDC, HDC,
+            PAINTSTRUCT, SRCCOPY, StretchDIBits,
+        },
         Media::{
             Audio::{
                 DirectSound::{
@@ -41,12 +51,7 @@ use windows::{
             WindowsAndMessaging::*,
         },
     },
-    core::*,
-};
-
-use hm::{
-    GameButton, GameButtonState, GameControllerInput, GameInput, GameMemory, GameOffscreenBuffer,
-    GameSoundOutputBuffer, game_update_and_render, gigabytes_to_bytes, megabytes_to_bytes,
+    core::{GUID, s},
 };
 
 /* TODO(aalhendi): THIS IS NOT A FINAL PLATFORM LAYER!!!
@@ -68,19 +73,25 @@ use hm::{
 
 */
 
-const BYTES_PER_PIXEL: i32 = 4;
 const KEY_MESSAGE_WAS_DOWN_BIT: i32 = 30;
 const KEY_MESSAGE_IS_DOWN_BIT: i32 = 31;
 const KEY_MESSAGE_IS_ALT_BIT: i32 = 29;
 
+// TODO(aalhendi): GetSystemMetrics(SM_SAMPLERATE)? How do we reliably query refresh rate? GetComposition?
+const MONITOR_REFRESH_HZ: i32 = 60;
+const GAME_UPDATE_HZ: i32 = MONITOR_REFRESH_HZ / 2;
+const TARGET_SECONDS_PER_FRAME: f64 = 1_f64 / GAME_UPDATE_HZ as f64;
+
 // TODO(aalhendi): This is a global for now.
 static mut GLOBAL_RUNNING: bool = false;
+static mut GLOBAL_PAUSE: bool = false;
 static mut GLOBAL_BACKBUFFER: Win32OffscreenBuffer = Win32OffscreenBuffer {
-    info: unsafe { mem::zeroed() }, // alloc'ed in win32_resize_dib_section, called v.early in main fn
+    info: unsafe { mem::zeroed() }, // alloc'ed in win32_resize_dib_section, called v.early in the main fn
     memory: ptr::null_mut(),
     width: 0,
     height: 0,
     pitch: 0,
+    bytes_per_pixel: 4,
 };
 
 static mut PERF_COUNT_FREQUENCY: i64 = 0;
@@ -160,7 +171,7 @@ fn win32_init_dsound(
 
     let secondary_buffer_desc = DSBUFFERDESC {
         dwSize: size_of::<DSBUFFERDESC>() as u32,
-        dwFlags: 0,
+        dwFlags: DSBCAPS_GETCURRENTPOSITION2 | DSBCAPS_GLOBALFOCUS | DSBCAPS_CTRL3D,
         dwBufferBytes: sound_output.buffer_size,
         dwReserved: 0,
         lpwfxFormat: &mut wave_format,
@@ -179,12 +190,26 @@ fn win32_init_dsound(
     Ok((ds, primary_buffer, secondary_buffer))
 }
 
+#[derive(Default, Copy, Clone)]
+struct Win32DebugTimeMarker {
+    pub output_play_cursor: u32,
+    pub output_write_cursor: u32,
+    pub output_location: u32,
+    pub output_byte_count: u32,
+    pub expected_flip_play_cursor: u32,
+
+    pub flip_play_cursor: u32,
+    pub flip_write_cursor: u32,
+}
+
 struct Win32SoundOutput {
     samples_per_second: u32,
     running_sample_index: u32,
     bytes_per_sample: u32,
     buffer_size: u32,
-    latency_sample_count: u32,
+    safety_bytes: u32,
+    // TODO(aalhendi): adding a "bytes_per_second" would simplify math.
+    // TODO(aalhendi): should runnning sample index be in bytes as well?
 }
 
 impl Win32SoundOutput {
@@ -196,7 +221,8 @@ impl Win32SoundOutput {
             running_sample_index: 0,
             bytes_per_sample,
             buffer_size: samples_per_second * bytes_per_sample, // 2 channels, 2 bytes per sample
-            latency_sample_count: samples_per_second / 15,
+            // TODO(aalhendi): actually compute this variance and see lowest reasonable value
+            safety_bytes: ((samples_per_second * bytes_per_sample) / GAME_UPDATE_HZ as u32) / 3,
         }
     }
 }
@@ -311,7 +337,7 @@ fn win32_fill_sound_buffer(
     }
 
     // for some reason, unlock expects a different signature than lock... so we have to do this
-    // refactor(aalhendi): we can have 2 unlock calls, one running if region2_ptr is null, and the other running if it is not null after the write
+    // refactor(aalhendi): we can have 2 unlock calls, one running if region2_ptr is null, and the other running if it is not null after write is done.
     let (final_ptr_region2, final_size_region2) = if region2_ptr.is_null() {
         (None, 0)
     } else {
@@ -386,13 +412,14 @@ struct Win32OffscreenBuffer {
     info: BITMAPINFO,
     // NOTE(aalhendi): void* to avoid specifying the type, we want windows to give us back a ptr to the bitmap memory
     //  windows doesn't know (on the API lvl), what sort of flags, and therefore what kind of memory we want.
-    //  CreateDIBSection also can't haveThe fn can only have one signature, it cant get a u8ptr OR a u64 ptr etc. so we pass a void* and cast appropriately
+    //  CreateDIBSection also can't haveThe fn can only have one signature, it can't get an u8ptr OR an u64 ptr etc. so we pass a void* and cast appropriately
     //  it is used as a double ptr because we give windows an addr of a ptr which we want it to OVERWRITE into a NEW PTR which would point to where it alloc'd mem
     memory: *mut ffi::c_void,
     // NOTE(aalhendi): We store width and height in self.info.bmiHeader. This is redundant. Keeping because its only 8 bytes
     width: i32,
     height: i32,
     pitch: isize,
+    bytes_per_pixel: i32,
 }
 
 impl Win32OffscreenBuffer {
@@ -433,7 +460,7 @@ impl Win32OffscreenBuffer {
         let bitmap_info_header = BITMAPINFOHEADER {
             biSize: size_of::<BITMAPINFOHEADER>() as u32,
             biWidth: self.width,
-            // NOTE(aalhendi): When bHeight is negative, it clues Windows to treat the bitmap as top-down rather than bottom-up. This means tht the first three bytes are for the top-left pixel.
+            // NOTE(aalhendi): When bHeight is negative, it clues Windows to treat the bitmap as top-down rather than bottom-up. This means that the first three bytes are for the top-left pixel.
             biHeight: -self.height,
             biPlanes: 1,
             biBitCount: 32, // 8 for red, 8 for green, 8 for blue, ask for 32 for DWORD alignment
@@ -447,7 +474,7 @@ impl Win32OffscreenBuffer {
 
         self.info.bmiHeader = bitmap_info_header;
 
-        let bitmap_memory_size = (BYTES_PER_PIXEL * self.width * self.height) as usize;
+        let bitmap_memory_size = (self.bytes_per_pixel * self.width * self.height) as usize;
         self.memory = unsafe {
             VirtualAlloc(
                 None,
@@ -457,12 +484,111 @@ impl Win32OffscreenBuffer {
             )
         };
 
-        self.pitch = (width * BYTES_PER_PIXEL) as isize;
+        self.pitch = (width * self.bytes_per_pixel) as isize;
         // TODO(aalhendi): Probably clear this to black
+    }
+
+    #[cfg(feature = "internal_build")]
+    fn debug_sync_display(
+        &mut self,
+        markers: &mut [Win32DebugTimeMarker],
+        current_marker_idx: usize,
+        sound_output: &mut Win32SoundOutput,
+        _seconds_per_frame: f64,
+    ) {
+        let pad_x = 16; // pixels
+        let pad_y = 16; // pixels
+
+        let line_height = 64;
+
+        let coefficient = (self.width - (2 * pad_x)) as f32 / sound_output.buffer_size as f32;
+
+        // NOTE(aalhendi): calculates the x coordinate of a given point in the sound buffer
+        let c_x = |pt: u32| pad_x + (pt as f32 * coefficient) as i32;
+
+        for (idx, marker) in markers.iter().enumerate() {
+            let mut top = pad_y;
+            let mut bottom = pad_y + line_height;
+
+            assert!(marker.flip_play_cursor < sound_output.buffer_size);
+            assert!(marker.flip_write_cursor < sound_output.buffer_size);
+            assert!(marker.output_play_cursor < sound_output.buffer_size);
+            assert!(marker.output_write_cursor < sound_output.buffer_size);
+            assert!(marker.output_location < sound_output.buffer_size);
+            assert!(marker.output_byte_count < sound_output.buffer_size); // clipped anyway, kinda useless
+            // Expected flip cursor is an added value, so it's allowed to be greater than the buffer size.
+
+            if idx == current_marker_idx {
+                top += pad_y + line_height;
+                bottom += pad_y + line_height;
+                let first_top = top;
+
+                self.debug_draw_vertical(c_x(marker.output_play_cursor), top, bottom, 0xFFFFFFFF);
+                self.debug_draw_vertical(c_x(marker.output_write_cursor), top, bottom, 0xFFFF0000);
+
+                top += pad_y + line_height;
+                bottom += pad_y + line_height;
+
+                self.debug_draw_vertical(c_x(marker.output_location), top, bottom, 0xFFFFFFFF);
+                self.debug_draw_vertical(
+                    c_x(marker.output_location + marker.output_byte_count),
+                    top,
+                    bottom,
+                    0xFFFF0000,
+                );
+
+                top += pad_y + line_height;
+                bottom += pad_y + line_height;
+
+                self.debug_draw_vertical(
+                    c_x(marker.expected_flip_play_cursor),
+                    first_top,
+                    bottom,
+                    0xFFFFFF00,
+                );
+            };
+
+            self.debug_draw_vertical(c_x(marker.flip_play_cursor), top, bottom, 0xFFFFFFFF);
+            self.debug_draw_vertical(
+                c_x(marker.flip_play_cursor + (480 * sound_output.bytes_per_sample)),
+                top,
+                bottom,
+                0xFFFF00FF,
+            );
+            self.debug_draw_vertical(c_x(marker.flip_write_cursor), top, bottom, 0xFFFF0000);
+        }
+    }
+
+    #[cfg(feature = "internal_build")]
+    fn debug_draw_vertical(&self, x: i32, top: i32, bottom: i32, color: u32) {
+        let top = if top <= 0 { 0 } else { top };
+
+        let bottom = if bottom > self.height {
+            self.height
+        } else {
+            bottom
+        };
+
+        if x < 0 || x >= self.width {
+            return;
+        }
+
+        let mut pixel = unsafe {
+            self.memory
+                .cast::<u8>()
+                .add((x * self.bytes_per_pixel) as usize)
+                .offset(top as isize * self.pitch)
+        };
+        for _y in top..bottom {
+            unsafe {
+                *(pixel as *mut u32) = color;
+                pixel = pixel.add(self.pitch as usize);
+            };
+        }
     }
 }
 
-fn main() -> Result<()> {
+fn main() -> windows::core::Result<()> {
     unsafe {
         let module_handle = GetModuleHandleA(None)?;
 
@@ -486,11 +612,6 @@ fn main() -> Result<()> {
             ..Default::default()
         };
 
-        // TODO(aalhendi): GetSystemMetrics(SM_SAMPLERATE)? How do we reliably query refresh rate? GetComposition?
-        let monitor_refresh_hz = 60_i32;
-        let game_update_hz = monitor_refresh_hz / 2;
-        let target_seconds_per_frame = 1_f64 / game_update_hz as f64;
-
         let atom = RegisterClassA(&wc);
         if atom == 0 {
             // TODO(aalhendi): Logging
@@ -511,14 +632,7 @@ fn main() -> Result<()> {
             None,
             Some(HINSTANCE::from(module_handle)),
             None,
-        )
-        .unwrap(); // TODO(aalhendi): use expect(), remove redundant debug assert.
-
-        if window_handle.is_invalid() {
-            // TODO(aalhendi): Logging
-            // return
-        }
-        debug_assert!(!window_handle.is_invalid());
+        )?;
 
         // NOTE(aalhendi): By using CS_OWNDC, can get one device context and keep using it forever since it is not shared.
         let device_context = GetDC(Some(window_handle));
@@ -527,7 +641,7 @@ fn main() -> Result<()> {
         // TODO(aalhendi): make this sixty seconds?
         let mut sound_output = Win32SoundOutput::new(48000);
 
-        // cant load direct sound till we have a window handle
+        // can't load direct sound till we have a window handle
         let (_ds, _primary_buffer, secondary_buffer) =
             win32_init_dsound(window_handle, &mut sound_output)?;
 
@@ -535,6 +649,18 @@ fn main() -> Result<()> {
         secondary_buffer.Play(0, 0, DSBPLAY_LOOPING)?;
 
         GLOBAL_RUNNING = true;
+
+        /*
+        // NOTE(aalhendi): this tests the PlayCursor/WriteCursor update frequency
+        // On my machine, it was 480 samples.
+        loop {
+            let mut play_cursor = 0_u32;
+            let mut write_cursor = 0_u32;
+            let _ = secondary_buffer
+                .GetCurrentPosition(Some(&mut play_cursor), Some(&mut write_cursor));
+            println!("PC:{play_cursor} WC: {write_cursor}");
+        }
+         */
 
         // TODO(aalhendi): pool with bitmap VirtualAlloc
         let samples = VirtualAlloc(
@@ -586,13 +712,24 @@ fn main() -> Result<()> {
         }
 
         let mut input = [GameInput::default(), GameInput::default()];
-        // NOTE(aalhendi): this is a hack to get around the fact that we cant have 2 mutable references to the same array
+        // NOTE(aalhendi): this is a hack to get around the fact that we can't have 2 mutable references to the same array
         let (new_input_slice, old_input_slice) = input.split_at_mut(1);
 
         let mut new_input = &mut new_input_slice[0];
         let mut old_input = &mut old_input_slice[0];
 
         let mut last_counter = win32_get_wall_clock();
+        let mut flip_wall_clock = win32_get_wall_clock();
+
+        #[cfg(feature = "internal_build")]
+        let mut debug_time_marker_idx = 0;
+        #[cfg(feature = "internal_build")]
+        let mut debug_time_markers = [Win32DebugTimeMarker::default(); GAME_UPDATE_HZ as usize / 2];
+
+        let mut audio_latency_bytes;
+        let mut audio_latency_sec;
+        let mut is_sound_valid = false;
+
         // TODO(aalhendi): do we want to use rdtscp instead?
         let mut last_cycle_count = x86_64::_rdtsc();
 
@@ -608,292 +745,402 @@ fn main() -> Result<()> {
 
             win32_process_pending_messages(new_keyboard_controller);
 
-            // TODO(aalhendi): should we poll this more frequently?
-            // TODO(aalhendi): need to not poll disconnected controllers to avoid xinput frame hit on older libraries
-            let mut max_controller_count = XUSER_MAX_COUNT;
-            if max_controller_count as usize > new_input.controllers.len() {
-                max_controller_count = new_input.controllers.len() as u32;
-            }
-            // NOTE(aalhendi): max controller count minus the keyboard controller
-            for controller_index in 0..max_controller_count - 1 {
-                let old_controller = &mut old_input.controllers[controller_index as usize];
-                let new_controller = &mut new_input.controllers[controller_index as usize];
-
-                let mut controller_state: XINPUT_STATE = XINPUT_STATE::default();
-                let x_input_state_res = XInputGetState(controller_index, &mut controller_state);
-                if x_input_state_res == ERROR_SUCCESS.0 {
-                    new_controller.is_connected = true;
-
-                    // NOTE(aalhendi): This controller is connected
-                    // TODO(aalhendi): see if controller_state.dwPacketNumber increments too rapidly
-                    let pad = &controller_state.Gamepad;
-
-                    let stick_left_x = win32_process_x_input_stick_value(
-                        pad.sThumbLX,
-                        XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE.0 as i16,
-                    );
-                    new_controller.left_stick_average_x = stick_left_x;
-
-                    let stick_left_y = win32_process_x_input_stick_value(
-                        pad.sThumbLY,
-                        XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE.0 as i16,
-                    );
-                    new_controller.left_stick_average_y = stick_left_y;
-
-                    if stick_left_x != 0.0 || stick_left_y != 0.0 {
-                        new_controller.is_analog = true;
-                    }
-
-                    // TODO(aalhendi): add right stick support
-
-                    if (pad.wButtons & XINPUT_GAMEPAD_DPAD_UP).0 != 0 {
-                        new_controller.is_analog = false;
-                        new_controller.left_stick_average_y = 1.0;
-                    }
-                    if (pad.wButtons & XINPUT_GAMEPAD_DPAD_DOWN).0 != 0 {
-                        new_controller.is_analog = false;
-                        new_controller.left_stick_average_y = -1.0;
-                    }
-                    if (pad.wButtons & XINPUT_GAMEPAD_DPAD_LEFT).0 != 0 {
-                        new_controller.is_analog = false;
-                        new_controller.left_stick_average_x = 1.0;
-                    }
-                    if (pad.wButtons & XINPUT_GAMEPAD_DPAD_RIGHT).0 != 0 {
-                        new_controller.is_analog = false;
-                        new_controller.left_stick_average_x = -1.0;
-                    }
-
-                    let threshold = 0.5_f32;
-                    // NOTE(aalhendi): fake dpad emulation from left stick
-                    win32_process_x_input_digital_button(
-                        XINPUT_GAMEPAD_BUTTON_FLAGS(
-                            (new_controller.left_stick_average_x < -threshold) as u16,
-                        ),
-                        old_controller.button_mut(GameButton::MoveLeft),
-                        XINPUT_GAMEPAD_DPAD_LEFT,
-                        new_controller.button_mut(GameButton::MoveLeft),
-                    );
-                    win32_process_x_input_digital_button(
-                        XINPUT_GAMEPAD_BUTTON_FLAGS(
-                            (new_controller.left_stick_average_x > threshold) as u16,
-                        ),
-                        old_controller.button_mut(GameButton::MoveRight),
-                        XINPUT_GAMEPAD_DPAD_RIGHT,
-                        new_controller.button_mut(GameButton::MoveRight),
-                    );
-                    win32_process_x_input_digital_button(
-                        XINPUT_GAMEPAD_BUTTON_FLAGS(
-                            (new_controller.left_stick_average_y < -threshold) as u16,
-                        ),
-                        old_controller.button_mut(GameButton::MoveUp),
-                        XINPUT_GAMEPAD_DPAD_UP,
-                        new_controller.button_mut(GameButton::MoveUp),
-                    );
-                    win32_process_x_input_digital_button(
-                        XINPUT_GAMEPAD_BUTTON_FLAGS(
-                            (new_controller.left_stick_average_y > threshold) as u16,
-                        ),
-                        old_controller.button_mut(GameButton::MoveDown),
-                        XINPUT_GAMEPAD_DPAD_DOWN,
-                        new_controller.button_mut(GameButton::MoveDown),
-                    );
-
-                    win32_process_x_input_digital_button(
-                        pad.wButtons,
-                        old_controller.button_mut(GameButton::ActionDown),
-                        XINPUT_GAMEPAD_A,
-                        new_controller.button_mut(GameButton::ActionDown),
-                    );
-
-                    win32_process_x_input_digital_button(
-                        pad.wButtons,
-                        old_controller.button_mut(GameButton::ActionRight),
-                        XINPUT_GAMEPAD_B,
-                        new_controller.button_mut(GameButton::ActionRight),
-                    );
-
-                    win32_process_x_input_digital_button(
-                        pad.wButtons,
-                        old_controller.button_mut(GameButton::ActionLeft),
-                        XINPUT_GAMEPAD_X,
-                        new_controller.button_mut(GameButton::ActionLeft),
-                    );
-
-                    win32_process_x_input_digital_button(
-                        pad.wButtons,
-                        old_controller.button_mut(GameButton::ActionUp),
-                        XINPUT_GAMEPAD_Y,
-                        new_controller.button_mut(GameButton::ActionUp),
-                    );
-
-                    win32_process_x_input_digital_button(
-                        pad.wButtons,
-                        old_controller.button_mut(GameButton::LeftShoulder),
-                        XINPUT_GAMEPAD_LEFT_SHOULDER,
-                        new_controller.button_mut(GameButton::LeftShoulder),
-                    );
-
-                    win32_process_x_input_digital_button(
-                        pad.wButtons,
-                        old_controller.button_mut(GameButton::RightShoulder),
-                        XINPUT_GAMEPAD_RIGHT_SHOULDER,
-                        new_controller.button_mut(GameButton::RightShoulder),
-                    );
-
-                    win32_process_x_input_digital_button(
-                        pad.wButtons,
-                        old_controller.button_mut(GameButton::Start),
-                        XINPUT_GAMEPAD_START,
-                        new_controller.button_mut(GameButton::Start),
-                    );
-
-                    win32_process_x_input_digital_button(
-                        pad.wButtons,
-                        old_controller.button_mut(GameButton::Back),
-                        XINPUT_GAMEPAD_BACK,
-                        new_controller.button_mut(GameButton::Back),
-                    );
-                } else {
-                    // NOTE(aalhendi): This controller is not available
-                    new_controller.is_connected = false;
+            if !GLOBAL_PAUSE {
+                // TODO(aalhendi): should we poll this more frequently?
+                // TODO(aalhendi): need to not poll disconnected controllers to avoid xinput frame hit on older libraries
+                let mut max_controller_count = XUSER_MAX_COUNT;
+                if max_controller_count as usize > new_input.controllers.len() {
+                    max_controller_count = new_input.controllers.len() as u32;
                 }
-            }
+                // NOTE(aalhendi): max controller count minus the keyboard controller
+                for controller_index in 0..max_controller_count - 1 {
+                    let old_controller = &mut old_input.controllers[controller_index as usize];
+                    let new_controller = &mut new_input.controllers[controller_index as usize];
 
-            // Test out vibration
-            windows::Win32::UI::Input::XboxController::XInputSetState(
-                0,
-                &windows::Win32::UI::Input::XboxController::XINPUT_VIBRATION {
-                    wLeftMotorSpeed: 65535,
-                    wRightMotorSpeed: 65535,
-                },
-            );
+                    let mut controller_state: XINPUT_STATE = XINPUT_STATE::default();
+                    let x_input_state_res = XInputGetState(controller_index, &mut controller_state);
+                    if x_input_state_res == ERROR_SUCCESS.0 {
+                        new_controller.is_connected = true;
 
-            // offset, in bytes, of the play cursor
-            let mut play_cursor = 0u32;
-            // offset, in bytes, of the write cursor
-            let mut write_cursor = 0u32;
-            let mut is_sound_valid = false;
-            let mut bytes_to_lock = 0u32;
-            let mut bytes_to_write = 0u32;
-            // TODO(aalhendi): tighten up sound logic so that we know where we should be writing to and we can anticipate the time spent in the game update
-            match secondary_buffer
-                .GetCurrentPosition(Some(&mut play_cursor), Some(&mut write_cursor))
-            {
-                Ok(_) => {
-                    // lock offset
-                    bytes_to_lock = sound_output
-                        .running_sample_index
-                        .overflowing_mul(sound_output.bytes_per_sample)
-                        .0
-                        % sound_output.buffer_size;
+                        // NOTE(aalhendi): This controller is connected
+                        // TODO(aalhendi): see if controller_state.dwPacketNumber increments too rapidly
+                        let pad = &controller_state.Gamepad;
 
-                    // lock size
-                    let target_write_cursor = (play_cursor
-                        + (sound_output.latency_sample_count * sound_output.bytes_per_sample))
-                        % sound_output.buffer_size;
-                    bytes_to_write = if bytes_to_lock > target_write_cursor {
-                        // case 1: we are wrapping around the ring buffer, fill 2 regions
-                        (sound_output.buffer_size - bytes_to_lock) + target_write_cursor
+                        let stick_left_x = win32_process_x_input_stick_value(
+                            pad.sThumbLX,
+                            XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE.0 as i16,
+                        );
+                        new_controller.left_stick_average_x = stick_left_x;
+
+                        let stick_left_y = win32_process_x_input_stick_value(
+                            pad.sThumbLY,
+                            XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE.0 as i16,
+                        );
+                        new_controller.left_stick_average_y = stick_left_y;
+
+                        if stick_left_x != 0.0 || stick_left_y != 0.0 {
+                            new_controller.is_analog = true;
+                        }
+
+                        // TODO(aalhendi): add right stick support
+
+                        if (pad.wButtons & XINPUT_GAMEPAD_DPAD_UP).0 != 0 {
+                            new_controller.is_analog = false;
+                            new_controller.left_stick_average_y = 1.0;
+                        }
+                        if (pad.wButtons & XINPUT_GAMEPAD_DPAD_DOWN).0 != 0 {
+                            new_controller.is_analog = false;
+                            new_controller.left_stick_average_y = -1.0;
+                        }
+                        if (pad.wButtons & XINPUT_GAMEPAD_DPAD_LEFT).0 != 0 {
+                            new_controller.is_analog = false;
+                            new_controller.left_stick_average_x = 1.0;
+                        }
+                        if (pad.wButtons & XINPUT_GAMEPAD_DPAD_RIGHT).0 != 0 {
+                            new_controller.is_analog = false;
+                            new_controller.left_stick_average_x = -1.0;
+                        }
+
+                        let threshold = 0.5_f32;
+                        // NOTE(aalhendi): fake dpad emulation from left stick
+                        win32_process_x_input_digital_button(
+                            XINPUT_GAMEPAD_BUTTON_FLAGS(
+                                (new_controller.left_stick_average_x < -threshold) as u16,
+                            ),
+                            old_controller.button_mut(GameButton::MoveLeft),
+                            XINPUT_GAMEPAD_DPAD_LEFT,
+                            new_controller.button_mut(GameButton::MoveLeft),
+                        );
+                        win32_process_x_input_digital_button(
+                            XINPUT_GAMEPAD_BUTTON_FLAGS(
+                                (new_controller.left_stick_average_x > threshold) as u16,
+                            ),
+                            old_controller.button_mut(GameButton::MoveRight),
+                            XINPUT_GAMEPAD_DPAD_RIGHT,
+                            new_controller.button_mut(GameButton::MoveRight),
+                        );
+                        win32_process_x_input_digital_button(
+                            XINPUT_GAMEPAD_BUTTON_FLAGS(
+                                (new_controller.left_stick_average_y < -threshold) as u16,
+                            ),
+                            old_controller.button_mut(GameButton::MoveUp),
+                            XINPUT_GAMEPAD_DPAD_UP,
+                            new_controller.button_mut(GameButton::MoveUp),
+                        );
+                        win32_process_x_input_digital_button(
+                            XINPUT_GAMEPAD_BUTTON_FLAGS(
+                                (new_controller.left_stick_average_y > threshold) as u16,
+                            ),
+                            old_controller.button_mut(GameButton::MoveDown),
+                            XINPUT_GAMEPAD_DPAD_DOWN,
+                            new_controller.button_mut(GameButton::MoveDown),
+                        );
+
+                        win32_process_x_input_digital_button(
+                            pad.wButtons,
+                            old_controller.button_mut(GameButton::ActionDown),
+                            XINPUT_GAMEPAD_A,
+                            new_controller.button_mut(GameButton::ActionDown),
+                        );
+
+                        win32_process_x_input_digital_button(
+                            pad.wButtons,
+                            old_controller.button_mut(GameButton::ActionRight),
+                            XINPUT_GAMEPAD_B,
+                            new_controller.button_mut(GameButton::ActionRight),
+                        );
+
+                        win32_process_x_input_digital_button(
+                            pad.wButtons,
+                            old_controller.button_mut(GameButton::ActionLeft),
+                            XINPUT_GAMEPAD_X,
+                            new_controller.button_mut(GameButton::ActionLeft),
+                        );
+
+                        win32_process_x_input_digital_button(
+                            pad.wButtons,
+                            old_controller.button_mut(GameButton::ActionUp),
+                            XINPUT_GAMEPAD_Y,
+                            new_controller.button_mut(GameButton::ActionUp),
+                        );
+
+                        win32_process_x_input_digital_button(
+                            pad.wButtons,
+                            old_controller.button_mut(GameButton::LeftShoulder),
+                            XINPUT_GAMEPAD_LEFT_SHOULDER,
+                            new_controller.button_mut(GameButton::LeftShoulder),
+                        );
+
+                        win32_process_x_input_digital_button(
+                            pad.wButtons,
+                            old_controller.button_mut(GameButton::RightShoulder),
+                            XINPUT_GAMEPAD_RIGHT_SHOULDER,
+                            new_controller.button_mut(GameButton::RightShoulder),
+                        );
+
+                        win32_process_x_input_digital_button(
+                            pad.wButtons,
+                            old_controller.button_mut(GameButton::Start),
+                            XINPUT_GAMEPAD_START,
+                            new_controller.button_mut(GameButton::Start),
+                        );
+
+                        win32_process_x_input_digital_button(
+                            pad.wButtons,
+                            old_controller.button_mut(GameButton::Back),
+                            XINPUT_GAMEPAD_BACK,
+                            new_controller.button_mut(GameButton::Back),
+                        );
                     } else {
-                        // case 2: we are not wrapping around the ring buffer, fill 1 region
-                        target_write_cursor - bytes_to_lock
-                    };
-
-                    is_sound_valid = true
+                        // NOTE(aalhendi): This controller is not available
+                        new_controller.is_connected = false;
+                    }
                 }
-                Err(e) => println!("Error getting sound position: {e:?}"),
-            }
 
-            // TODO(aalhendi): sound buffer is wrong now because its not updated to work with new frame loop
-            let mut sound_buffer = GameSoundOutputBuffer {
-                samples_per_second: sound_output.samples_per_second,
-                sample_count: bytes_to_write / sound_output.bytes_per_sample,
-                samples,
-            };
+                // Test out vibration
+                windows::Win32::UI::Input::XboxController::XInputSetState(
+                    0,
+                    &windows::Win32::UI::Input::XboxController::XINPUT_VIBRATION {
+                        wLeftMotorSpeed: 65535,
+                        wRightMotorSpeed: 65535,
+                    },
+                );
 
-            let mut buffer = GameOffscreenBuffer {
-                width: GLOBAL_BACKBUFFER.width,
-                height: GLOBAL_BACKBUFFER.height,
-                pitch: GLOBAL_BACKBUFFER.pitch,
-                memory: GLOBAL_BACKBUFFER.memory,
-            };
+                let mut buffer = GameOffscreenBuffer {
+                    width: GLOBAL_BACKBUFFER.width,
+                    height: GLOBAL_BACKBUFFER.height,
+                    pitch: GLOBAL_BACKBUFFER.pitch,
+                    memory: GLOBAL_BACKBUFFER.memory,
+                };
+                game_update_and_render(&mut game_memory, new_input, &mut buffer);
 
-            game_update_and_render(&mut game_memory, new_input, &mut buffer, &mut sound_buffer);
+                /*
+                NOTE(aalhendi): Here is how sound output computation works.
 
-            if is_sound_valid {
-                // NOTE(aalhendi): ideally, we want to only fill sound buffer if there's something to write.
-                // this fn calls Lock(), which can fail if bytes_to_write is 0
-                // we are ignoring the error for now, skipping this frame if it fails. This is to match C behavior.
-                // from testing, this only happens the first time call occurs. we could have a if check to see if bytes_to_write is 0
-                // but that check would run every frame, which is not ideal.
-                if let Err(e) = win32_fill_sound_buffer(
-                    &secondary_buffer,
-                    &mut sound_output,
-                    bytes_to_lock,
-                    bytes_to_write,
-                    &mut sound_buffer,
-                ) {
-                    println!("Error filling sound buffer: {e:?}");
-                }
-            }
+                We define a safety value that is the number of samples we think our game update loop
+                may vary by (let's say up to 2 ms)
 
-            // TODO(aalhendi): NOT TESTED YET!
-            let work_counter = win32_get_wall_clock();
-            let work_seconds_elapsed = win32_get_seconds_elapsed(last_counter, work_counter);
+                When we wake up to write audio, we will look and see what the play cursor position is,
+                and we will forecast ahead where we think the play cursor will be on the next frame boundary.
 
-            let mut seconds_elapsed_for_frame = work_seconds_elapsed;
-            if seconds_elapsed_for_frame < target_seconds_per_frame {
-                while seconds_elapsed_for_frame < target_seconds_per_frame {
-                    if sleep_is_granular {
-                        let sleep_ms =
-                            (target_seconds_per_frame - seconds_elapsed_for_frame) * 1000_f64;
-                        if sleep_ms > 1_f64 {
-                            // TODO(aalhendi): sleeping is hard... see Intel's TPAUSE instruction. I think AMD uses UMWAIT.
-                            windows::Win32::System::Threading::Sleep(sleep_ms as u32);
+                We will then look to see if the write cursor is before that by our safe amount.
+                If it is, the target fill position is that frame boundary plus one frame.
+                This gives us perfect audio sync in the case of a card that has low enough latency.
+
+                If the write cursor is *after* that safety margin,
+                then we assume we can never sync the audio perfectly,
+                 so we will write one frame's worth of audio plus the safety margin's worth of guard samples.
+                 */
+                let audio_wall_clock = win32_get_wall_clock();
+                let from_begin_to_audio_seconds =
+                    win32_get_seconds_elapsed(flip_wall_clock, audio_wall_clock);
+                let mut play_cursor = 0_u32;
+                let mut write_cursor = 0_u32;
+
+                match secondary_buffer
+                    .GetCurrentPosition(Some(&mut play_cursor), Some(&mut write_cursor))
+                {
+                    Ok(_) => {
+                        if !is_sound_valid {
+                            sound_output.running_sample_index =
+                                write_cursor / sound_output.bytes_per_sample;
+                            is_sound_valid = true;
+                        }
+
+                        // lock offset
+                        let bytes_to_lock = sound_output
+                            .running_sample_index
+                            .overflowing_mul(sound_output.bytes_per_sample)
+                            .0
+                            % sound_output.buffer_size;
+
+                        let expected_sound_bytes_per_frame = (sound_output.samples_per_second
+                            * sound_output.bytes_per_sample)
+                            / GAME_UPDATE_HZ as u32;
+                        let seconds_left_until_flip =
+                            TARGET_SECONDS_PER_FRAME - from_begin_to_audio_seconds;
+                        let expected_bytes_until_flip = ((seconds_left_until_flip
+                            / TARGET_SECONDS_PER_FRAME)
+                            * expected_sound_bytes_per_frame as f64)
+                            as u32;
+                        let expected_frame_boundary_byte = play_cursor + expected_bytes_until_flip;
+                        let safe_write_cursor = if write_cursor < play_cursor {
+                            write_cursor + sound_output.buffer_size + sound_output.safety_bytes
+                        } else {
+                            write_cursor + sound_output.safety_bytes
+                        };
+                        debug_assert!(safe_write_cursor - sound_output.safety_bytes >= play_cursor);
+                        let is_low_latency_audio_card =
+                            safe_write_cursor < expected_frame_boundary_byte;
+
+                        // lock size
+                        let target_write_cursor = if is_low_latency_audio_card {
+                            (expected_frame_boundary_byte + expected_sound_bytes_per_frame)
+                                % sound_output.buffer_size
+                        } else {
+                            (write_cursor
+                                + expected_sound_bytes_per_frame
+                                + sound_output.safety_bytes)
+                                % sound_output.buffer_size
+                        };
+                        let bytes_to_write = if bytes_to_lock > target_write_cursor {
+                            // case 1: we are wrapping around the ring buffer, fill 2 regions
+                            (sound_output.buffer_size - bytes_to_lock) + target_write_cursor
+                        } else {
+                            // case 2: we are not wrapping around the ring buffer, fill 1 region
+                            target_write_cursor - bytes_to_lock
+                        };
+
+                        #[cfg(feature = "internal_build")]
+                        {
+                            let current_debug_marker =
+                                &mut debug_time_markers[debug_time_marker_idx];
+
+                            current_debug_marker.output_play_cursor = play_cursor;
+                            current_debug_marker.output_write_cursor = write_cursor;
+                            current_debug_marker.output_location = bytes_to_lock;
+                            current_debug_marker.output_byte_count = bytes_to_write;
+                            current_debug_marker.expected_flip_play_cursor =
+                                expected_frame_boundary_byte;
+
+                            let unwrapped_write_cursor = if write_cursor < play_cursor {
+                                write_cursor + sound_output.buffer_size
+                            } else {
+                                write_cursor
+                            };
+
+                            audio_latency_bytes = unwrapped_write_cursor - play_cursor;
+                            audio_latency_sec = (audio_latency_bytes as f32
+                                / sound_output.bytes_per_sample as f32)
+                                / sound_output.samples_per_second as f32;
+
+                            println!(
+                                "BTL:{bytes_to_lock} TC:{target_write_cursor} BTW:{bytes_to_write} - PC:{play_cursor} WC:{write_cursor} DELTA:{audio_latency_bytes} ({audio_latency_sec:.3}s)"
+                            );
+                        }
+
+                        let mut sound_buffer = GameSoundOutputBuffer {
+                            samples_per_second: sound_output.samples_per_second,
+                            sample_count: bytes_to_write / sound_output.bytes_per_sample,
+                            samples,
+                        };
+                        game_get_sound_samples(&mut game_memory, &mut sound_buffer);
+
+                        // NOTE(aalhendi): ideally, we want to only fill sound buffer if there's something to write.
+                        // this fn calls Lock(), which can fail if bytes_to_write is 0,
+                        // we are ignoring the error for now, skipping this frame if it fails. This is to match C behavior.
+                        // from testing, this only happens the first time the call occurs. we could have an if check to see if bytes_to_write is 0,
+                        // but that check would run every frame, which is not ideal.
+                        if let Err(e) = win32_fill_sound_buffer(
+                            &secondary_buffer,
+                            &mut sound_output,
+                            bytes_to_lock,
+                            bytes_to_write,
+                            &mut sound_buffer,
+                        ) {
+                            println!("Error filling sound buffer: {e:?}");
                         }
                     }
-
-                    #[cfg(feature = "internal_build")]
-                    {
-                        let test_seconds_elapsed_for_frame =
-                            win32_get_seconds_elapsed(last_counter, win32_get_wall_clock());
-                        const FRAME_TIME_SLOP_S: f64 = 0.002;
-                        debug_assert!(
-                            test_seconds_elapsed_for_frame
-                                < target_seconds_per_frame + FRAME_TIME_SLOP_S,
-                            "Test seconds elapsed for frame is greater than target seconds per frame {test_seconds_elapsed_for_frame} > {target_seconds_per_frame}"
-                        );
+                    Err(_) => {
+                        is_sound_valid = false;
                     }
-
-                    seconds_elapsed_for_frame =
-                        win32_get_seconds_elapsed(last_counter, win32_get_wall_clock());
                 }
-            } else {
-                // TODO(aalhendi): handle missed frame
+
+                // TODO(aalhendi): NOT TESTED YET!
+                let work_counter = win32_get_wall_clock();
+                let work_seconds_elapsed = win32_get_seconds_elapsed(last_counter, work_counter);
+
+                let mut seconds_elapsed_for_frame = work_seconds_elapsed;
+                if seconds_elapsed_for_frame < TARGET_SECONDS_PER_FRAME {
+                    while seconds_elapsed_for_frame < TARGET_SECONDS_PER_FRAME {
+                        if sleep_is_granular {
+                            let sleep_ms =
+                                (TARGET_SECONDS_PER_FRAME - seconds_elapsed_for_frame) * 1000_f64;
+                            if sleep_ms > 1_f64 {
+                                // TODO(aalhendi): sleeping is hard... see Intel's TPAUSE instruction. I think AMD uses UMWAIT.
+                                windows::Win32::System::Threading::Sleep(sleep_ms as u32);
+                            }
+                        }
+
+                        #[cfg(feature = "internal_build")]
+                        {
+                            let test_seconds_elapsed_for_frame =
+                                win32_get_seconds_elapsed(last_counter, win32_get_wall_clock());
+                            const FRAME_TIME_SLOP_S: f64 = 0.002;
+                            debug_assert!(
+                                test_seconds_elapsed_for_frame
+                                    < TARGET_SECONDS_PER_FRAME + FRAME_TIME_SLOP_S,
+                                "Test seconds elapsed for frame is greater than target seconds per frame {test_seconds_elapsed_for_frame} > {TARGET_SECONDS_PER_FRAME}"
+                            );
+                        }
+
+                        seconds_elapsed_for_frame =
+                            win32_get_seconds_elapsed(last_counter, win32_get_wall_clock());
+                    }
+                } else {
+                    // TODO(aalhendi): handle missed frame
+                    println!(
+                        "MISSED TARGET FPS!!! {seconds_elapsed_for_frame} < {TARGET_SECONDS_PER_FRAME}"
+                    );
+                }
+
+                let end_counter = win32_get_wall_clock();
+                let ms_per_frame = 1_000_f64 * win32_get_seconds_elapsed(last_counter, end_counter);
+                last_counter = end_counter;
+
+                let dims = Win32WindowDimension::from(window_handle);
+                #[cfg(feature = "internal_build")]
+                GLOBAL_BACKBUFFER.debug_sync_display(
+                    &mut debug_time_markers,
+                    if debug_time_marker_idx == 0 {
+                        debug_time_marker_idx
+                    } else {
+                        debug_time_marker_idx - 1
+                    },
+                    &mut sound_output,
+                    TARGET_SECONDS_PER_FRAME,
+                );
+
+                GLOBAL_BACKBUFFER.win32_copy_buffer_to_window(
+                    device_context,
+                    dims.width,
+                    dims.height,
+                );
+
+                flip_wall_clock = win32_get_wall_clock();
+
+                #[cfg(feature = "internal_build")]
+                {
+                    // NOTE(aalhendi): This is debug code
+                    let mut play_cursor = 0_u32;
+                    let mut write_cursor = 0_u32;
+                    secondary_buffer
+                        .GetCurrentPosition(Some(&mut play_cursor), Some(&mut write_cursor))?;
+                    debug_assert!(debug_time_marker_idx <= debug_time_markers.len());
+                    let current_debug_marker = &mut debug_time_markers[debug_time_marker_idx];
+
+                    current_debug_marker.flip_play_cursor = play_cursor;
+                    current_debug_marker.flip_write_cursor = write_cursor;
+
+                    debug_time_marker_idx += 1;
+                    if debug_time_marker_idx == debug_time_markers.len() {
+                        debug_time_marker_idx = 0;
+                    }
+                }
+
+                mem::swap(&mut new_input, &mut old_input);
+                // TODO(aalhendi): should i clear these here?
+
+                let end_cycle_count = x86_64::_rdtsc();
+                let cycles_elapsed = end_cycle_count as f64 - last_cycle_count as f64;
+                last_cycle_count = end_cycle_count;
+
+                let fps = 0_f64; // TODO(aalhendi): calculate fps
                 println!(
-                    "MISSED TARGET FPS!!! {seconds_elapsed_for_frame} < {target_seconds_per_frame}"
+                    "{ms_per_frame:.2} ms/frame - {fps:.1} fps - {mc:.2} mega_cycles/frame",
+                    mc = cycles_elapsed / (1_000_f64 * 1_000_f64)
                 );
             }
-
-            let dims = Win32WindowDimension::from(window_handle);
-            GLOBAL_BACKBUFFER.win32_copy_buffer_to_window(device_context, dims.width, dims.height);
-
-            mem::swap(&mut new_input, &mut old_input);
-            // TODO(aalhendi): should i clear these here?
-
-            let end_counter = win32_get_wall_clock();
-            let ms_per_frame = 1_000_f64 * win32_get_seconds_elapsed(last_counter, end_counter);
-            last_counter = end_counter;
-
-            let end_cycle_count = x86_64::_rdtsc();
-            let cycles_elapsed = end_cycle_count as f64 - last_cycle_count as f64;
-            last_cycle_count = end_cycle_count;
-
-            let fps = 0_f64; // TODO(aalhendi): calculate fps
-            println!(
-                "{ms_per_frame:.2} ms/frame - {fps:.1} fps - {mc:.2} mega_cycles/frame",
-                mc = cycles_elapsed as f64 / (1_000_f64 * 1_000_f64)
-            );
         }
 
         Ok(())
@@ -913,6 +1160,9 @@ unsafe fn win32_process_pending_messages(keyboard_controller: &mut GameControlle
                 let is_down = (message.lParam.0 & (1 << KEY_MESSAGE_IS_DOWN_BIT)) == 0;
                 let is_alt_down = (message.lParam.0 & (1 << KEY_MESSAGE_IS_ALT_BIT)) != 0;
                 if was_down != is_down {
+                    #[allow(unreachable_patterns)]
+                    #[allow(unused_variables)]
+                    #[allow(non_snake_case)]
                     match VIRTUAL_KEY(virtual_key_code.0 as u16) {
                         VK_W => win32_process_keyboard_message(
                             keyboard_controller.button_mut(GameButton::MoveUp),
@@ -966,6 +1216,14 @@ unsafe fn win32_process_pending_messages(keyboard_controller: &mut GameControlle
                             println!("Alt + F4 pressed, quitting...");
                             unsafe {
                                 GLOBAL_RUNNING = false;
+                            }
+                        }
+                        VK_P => {
+                            #[cfg(feature = "internal_build")]
+                            unsafe {
+                                if is_down {
+                                    GLOBAL_PAUSE = !GLOBAL_PAUSE
+                                }
                             }
                         }
                         _ => {}
