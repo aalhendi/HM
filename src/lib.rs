@@ -1,5 +1,3 @@
-#![feature(variant_count)]
-
 // NOTE(aalhendi): Services that the platform layer provides to the game
 
 #[cfg(feature = "internal_build")]
@@ -210,7 +208,8 @@ pub struct GameControllerInput {
     pub right_stick_average_x: f32,
     pub right_stick_average_y: f32,
 
-    pub buttons: [GameButtonState; core::mem::variant_count::<GameButton>()],
+    // pub buttons: [GameButtonState; core::mem::variant_count::<GameButton>()],
+    pub buttons: [GameButtonState; 12], // TODO(aalhendi): mem::variant_count is not stable yet.
 }
 
 impl GameControllerInput {
