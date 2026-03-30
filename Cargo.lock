@@ -3,11 +3,15 @@
 version = 4
 
 [[package]]
-name = "hm"
+name = "game"
 version = "0.1.0"
 dependencies = [
- "windows",
+ "interface",
 ]
+
+[[package]]
+name = "interface"
+version = "0.1.0"
 
 [[package]]
 name = "proc-macro2"
@@ -20,9 +24,9 @@ dependencies = [
 
 [[package]]
 name = "quote"
-version = "1.0.44"
+version = "1.0.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "21b2ebcf727b7760c461f091f9f0f539b77b8e87f2fd88131e7f1b433b3cece4"
+checksum = "41f2619966050689382d2b44f664f4bc593e129785a36d6ee376ddf37259b924"
 dependencies = [
  "proc-macro2",
 ]
@@ -43,6 +47,14 @@ name = "unicode-ident"
 version = "1.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
+
+[[package]]
+name = "win32_platform"
+version = "0.1.0"
+dependencies = [
+ "interface",
+ "windows",
+]
 
 [[package]]
 name = "windows"

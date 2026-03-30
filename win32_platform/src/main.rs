@@ -1,17 +1,19 @@
 #![allow(static_mut_refs)]
 
 use core::{arch::x86_64, ffi, mem, ptr};
-use hm::{
+use interface::{
     GameButton, GameButtonState, GameControllerInput, GameInput, GameMemory, GameOffscreenBuffer,
-    GameSoundOutputBuffer, game_get_sound_samples, game_update_and_render, gigabytes_to_bytes,
-    megabytes_to_bytes,
+    GameSoundOutputBuffer, gigabytes_to_bytes, megabytes_to_bytes,
 };
-use windows::Win32::Media::Audio::DirectSound::{
-    DSBCAPS_CTRL3D, DSBCAPS_GETCURRENTPOSITION2, DSBCAPS_GLOBALFOCUS,
-};
+
+#[cfg(feature = "internal_build")]
+use interface::DebugPlatformReadFileResult;
+
 use windows::{
     Win32::{
-        Foundation::{ERROR_SUCCESS, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM},
+        Foundation::{
+            ERROR_SUCCESS, FreeLibrary, HINSTANCE, HMODULE, HWND, LPARAM, LRESULT, RECT, WPARAM,
+        },
         Graphics::Gdi::{
             BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BeginPaint, DIB_RGB_COLORS, EndPaint, GetDC, HDC,
             PAINTSTRUCT, SRCCOPY, StretchDIBits,
@@ -19,6 +21,7 @@ use windows::{
         Media::{
             Audio::{
                 DirectSound::{
+                    DSBCAPS_CTRL3D, DSBCAPS_GETCURRENTPOSITION2, DSBCAPS_GLOBALFOCUS,
                     DSBCAPS_PRIMARYBUFFER, DSBPLAY_LOOPING, DSBUFFERDESC, DSSCL_PRIORITY,
                     DirectSoundCreate, IDirectSoundBuffer,
                 },
@@ -26,8 +29,9 @@ use windows::{
             },
             TIMERR_NOERROR, timeBeginPeriod,
         },
+        Storage::FileSystem::CopyFileA,
         System::{
-            LibraryLoader::GetModuleHandleA,
+            LibraryLoader::{GetModuleHandleA, GetProcAddress, LoadLibraryA},
             Memory::{
                 MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
             },
@@ -51,9 +55,8 @@ use windows::{
             WindowsAndMessaging::*,
         },
     },
-    core::{GUID, s},
+    core::{GUID, PCSTR, s},
 };
-
 /* TODO(aalhendi): THIS IS NOT A FINAL PLATFORM LAYER!!!
 
 - Saved game locations
@@ -95,6 +98,98 @@ static mut GLOBAL_BACKBUFFER: Win32OffscreenBuffer = Win32OffscreenBuffer {
 };
 
 static mut PERF_COUNT_FREQUENCY: i64 = 0;
+
+pub type GameUpdateAndRenderFn = unsafe extern "C" fn(
+    memory: &mut GameMemory,
+    input: &mut GameInput,
+    buffer: &mut GameOffscreenBuffer,
+);
+
+pub type GameGetSoundSamplesFn =
+    unsafe extern "C" fn(memory: &mut GameMemory, sound_buffer: &mut GameSoundOutputBuffer);
+
+// NOTE(aalhendi): if the DLL fails to load, the function pointers still point to valid memory.
+// This prevents the game from crashing if DLL is momentarily missing.
+// we COULD use Option<T> to handle missing data, but we don't want an `if` branch running 60x/sec
+unsafe extern "C" fn game_update_and_render_stub(
+    _memory: &mut GameMemory,
+    _input: &mut GameInput,
+    _buffer: &mut GameOffscreenBuffer,
+) {
+    // Do nothing.
+}
+
+unsafe extern "C" fn game_get_sound_samples_stub(
+    _memory: &mut GameMemory,
+    _sound_buffer: &mut GameSoundOutputBuffer,
+) {
+    // Do nothing.
+}
+
+struct Win32GameCode {
+    // Windows DLL handle (we'll need this to unload it later)
+    pub game_code_dll: HMODULE,
+
+    // The function pointers
+    pub update_and_render: GameUpdateAndRenderFn,
+    pub get_sound_samples: GameGetSoundSamplesFn,
+
+    pub is_valid: bool,
+}
+
+fn win32_load_game_code(dll_file_path: PCSTR) -> Win32GameCode {
+    let mut game_code = Win32GameCode {
+        game_code_dll: HMODULE::default(),
+        update_and_render: game_update_and_render_stub,
+        get_sound_samples: game_get_sound_samples_stub,
+        is_valid: false,
+    };
+
+    unsafe {
+        // NOTE(aalhendi): we are using a temp file here because we want to load the DLL into memory,
+        // without locking the file which Windows will do if we try to load it directly.
+        // TODO(aalhendi): proper path here (cargo run fails because of /target directory)
+        // TODO(aalhendi): determine when updates are necessary automatically. (hash?)
+        CopyFileA(dll_file_path, s!("game_temp.dll"), false)
+            .expect("Failed to copy DLL to temp file");
+        let game_code_dll_handle = LoadLibraryA(s!("game_temp.dll"));
+
+        if let Ok(handle) = game_code_dll_handle {
+            game_code.game_code_dll = handle;
+
+            let update_proc = GetProcAddress(handle, s!("game_update_and_render"));
+            let sound_proc = GetProcAddress(handle, s!("game_get_sound_samples"));
+
+            if let (Some(update_ptr), Some(sound_ptr)) = (update_proc, sound_proc) {
+                game_code.update_and_render = mem::transmute::<
+                    unsafe extern "system" fn() -> isize,
+                    GameUpdateAndRenderFn,
+                >(update_ptr);
+                game_code.get_sound_samples = mem::transmute::<
+                    unsafe extern "system" fn() -> isize,
+                    GameGetSoundSamplesFn,
+                >(sound_ptr);
+                game_code.is_valid = true;
+            } else {
+                // NOTE(aalhendi): we are already safely pointing to stubs!
+                println!("Error: Found the DLL, but couldn't find the functions inside it.");
+            }
+        }
+    }
+
+    game_code
+}
+
+fn win32_unload_game_code(game_code: &mut Win32GameCode) {
+    if game_code.game_code_dll != HMODULE::default() {
+        unsafe {
+            FreeLibrary(game_code.game_code_dll).expect("Failed to unload DLL");
+        }
+        game_code.is_valid = false;
+        game_code.get_sound_samples = game_get_sound_samples_stub;
+        game_code.update_and_render = game_update_and_render_stub;
+    }
+}
 
 #[inline(always)]
 fn win32_get_wall_clock() -> i64 {
@@ -191,6 +286,7 @@ fn win32_init_dsound(
 }
 
 #[derive(Default, Copy, Clone)]
+#[cfg(feature = "internal_build")]
 struct Win32DebugTimeMarker {
     pub output_play_cursor: u32,
     pub output_write_cursor: u32,
@@ -677,7 +773,7 @@ fn main() -> windows::core::Result<()> {
         let base_address = {
             #[cfg(feature = "internal_build")]
             {
-                use hm::terabytes_to_bytes;
+                use interface::terabytes_to_bytes;
                 terabytes_to_bytes(2)
             }
             #[cfg(not(feature = "internal_build"))]
@@ -702,6 +798,12 @@ fn main() -> windows::core::Result<()> {
                 .cast::<u8>()
                 .add(permanent_storage_size)
                 .cast::<()>(),
+            #[cfg(feature = "internal_build")]
+            debug_platform_read_entire_file,
+            #[cfg(feature = "internal_build")]
+            debug_platform_write_entire_file,
+            #[cfg(feature = "internal_build")]
+            debug_platform_free_file_memory,
         };
 
         if samples.is_null()
@@ -726,14 +828,27 @@ fn main() -> windows::core::Result<()> {
         #[cfg(feature = "internal_build")]
         let mut debug_time_markers = [Win32DebugTimeMarker::default(); GAME_UPDATE_HZ as usize / 2];
 
+        #[cfg(feature = "internal_build")]
         let mut audio_latency_bytes;
+        #[cfg(feature = "internal_build")]
         let mut audio_latency_sec;
         let mut is_sound_valid = false;
+
+        let mut game = win32_load_game_code(PCSTR::from_raw(c"hm.dll".as_ptr().cast::<u8>()));
+        let mut load_counter = 0;
 
         // TODO(aalhendi): do we want to use rdtscp instead?
         let mut last_cycle_count = x86_64::_rdtsc();
 
         while GLOBAL_RUNNING {
+            if load_counter > 120 {
+                win32_unload_game_code(&mut game);
+                game = win32_load_game_code(PCSTR::from_raw(c"hm.dll".as_ptr().cast::<u8>()));
+
+                load_counter = 0;
+            } else {
+                load_counter += 1;
+            }
             let new_keyboard_controller = &mut new_input.controllers[0];
             let old_keyboard_controller = &mut old_input.controllers[0];
             // TODO(aalhendi): we can't zero everything because the up/down count will be wrong
@@ -912,7 +1027,7 @@ fn main() -> windows::core::Result<()> {
                     pitch: GLOBAL_BACKBUFFER.pitch,
                     memory: GLOBAL_BACKBUFFER.memory,
                 };
-                game_update_and_render(&mut game_memory, new_input, &mut buffer);
+                (game.update_and_render)(&mut game_memory, new_input, &mut buffer);
 
                 /*
                 NOTE(aalhendi): Here is how sound output computation works.
@@ -1024,7 +1139,7 @@ fn main() -> windows::core::Result<()> {
                             sample_count: bytes_to_write / sound_output.bytes_per_sample,
                             samples,
                         };
-                        game_get_sound_samples(&mut game_memory, &mut sound_buffer);
+                        (game.get_sound_samples)(&mut game_memory, &mut sound_buffer);
 
                         // NOTE(aalhendi): ideally, we want to only fill sound buffer if there's something to write.
                         // this fn calls Lock(), which can fail if bytes_to_write is 0,
@@ -1282,6 +1397,137 @@ extern "system" fn win32_main_window_callback(
                 LRESULT(0)
             }
             _ => DefWindowProcA(window, message, wparam, lparam),
+        }
+    }
+}
+
+#[cfg(feature = "internal_build")]
+/// # Safety
+/// TODO(aalhendi): idk. write this up
+pub unsafe extern "C" fn debug_platform_free_file_memory(ptr: *mut ffi::c_void) {
+    unsafe {
+        if !ptr.is_null() {
+            // TODO(aalhendi): hanlde the result
+            let _ = VirtualFree(ptr, 0, MEM_RELEASE);
+        } else {
+            eprintln!("Failed to free file memory: ptr is null");
+        }
+    }
+}
+
+#[cfg(feature = "internal_build")]
+pub extern "C" fn debug_platform_write_entire_file(
+    filename: *const ffi::c_char,
+    memory_size: u32,
+    memory: *mut ffi::c_void,
+) -> bool {
+    unsafe {
+        use windows::Win32::{
+            Foundation::{CloseHandle, GENERIC_WRITE},
+            Storage::FileSystem::{
+                CREATE_ALWAYS, CreateFileA, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_NONE, WriteFile,
+            },
+        };
+
+        let filename = PCSTR::from_raw(filename.cast::<u8>());
+        let file_handle = match CreateFileA(
+            filename,
+            GENERIC_WRITE.0,
+            FILE_SHARE_NONE,
+            None,
+            CREATE_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL,
+            None,
+        ) {
+            Ok(handle) => handle,
+            Err(e) => {
+                eprintln!("Failed to create file: {e:?}");
+                return false;
+            }
+        };
+
+        let mut bytes_written = 0_u32;
+        let buffer = std::slice::from_raw_parts_mut(memory.cast::<u8>(), memory_size as usize);
+        let write_result = WriteFile(file_handle, Some(buffer), Some(&mut bytes_written), None);
+        if write_result.is_err() || bytes_written != memory_size {
+            eprintln!("Failed to write file: {write_result:?}");
+        }
+
+        // NOTE(aalhendi): we COULD have a RAII guard for the file handle, but it's not worth the complexity.
+        // where we impl Drop for FileHandleGuard, and we closethe handle in the drop.
+        // so for now we just close it manually.
+        // TODO(aalhendi): handle the result
+        let _ = CloseHandle(file_handle);
+
+        true
+    }
+}
+
+#[cfg(feature = "internal_build")]
+pub extern "C" fn debug_platform_read_entire_file(
+    filename: *const ffi::c_char,
+) -> DebugPlatformReadFileResult {
+    unsafe {
+        use interface::safe_truncate_i64_to_u32;
+        use windows::Win32::{
+            Foundation::{CloseHandle, GENERIC_READ, GetLastError},
+            Storage::FileSystem::{
+                CreateFileA, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, GetFileSizeEx, OPEN_EXISTING,
+                ReadFile,
+            },
+        };
+
+        let filename = PCSTR::from_raw(filename.cast::<u8>());
+        let file_handle = CreateFileA(
+            filename,
+            GENERIC_READ.0,
+            FILE_SHARE_READ,
+            None,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            None,
+        )
+        .expect("Failed to open file");
+
+        let mut file_size = 0_i64;
+        GetFileSizeEx(file_handle, &mut file_size).expect("Failed to get file size");
+        let file_size_u32 = safe_truncate_i64_to_u32(file_size);
+
+        if file_size == 0 {
+            // NOTE(aalhendi): Reading an empty file isn't an error. We can return null or allocate a 1 byte buffer if caller expects a non-null ptr.
+            // we will return null and let the caller handle it.
+            return DebugPlatformReadFileResult {
+                memory: ptr::null_mut(),
+                size: 0,
+            };
+        }
+
+        let mut memory_ptr = VirtualAlloc(None, file_size as usize, MEM_COMMIT, PAGE_READWRITE);
+
+        if memory_ptr.is_null() {
+            let err = windows::core::Error::from(GetLastError().to_hresult()).to_string();
+            panic!("Failed to allocate memory for file: {err}");
+        }
+
+        let buffer = std::slice::from_raw_parts_mut(memory_ptr as *mut u8, file_size_u32 as usize);
+
+        let mut bytes_read = 0_u32;
+        let read_result = ReadFile(file_handle, Some(buffer), Some(&mut bytes_read), None);
+        if read_result.is_err() || bytes_read != file_size_u32 {
+            debug_platform_free_file_memory(memory_ptr);
+            eprintln!("Failed to read file: {read_result:?}");
+            // sound because we just freed the memory
+            memory_ptr = ptr::null_mut();
+        }
+
+        // NOTE(aalhendi): we COULD have a RAII guard for the file handle, but it's not worth the complexity.
+        // where we impl Drop for FileHandleGuard, and we closethe handle in the drop.
+        // so for now we just close it manually.
+        // TODO(aalhendi): handle the result
+        let _ = CloseHandle(file_handle);
+        DebugPlatformReadFileResult {
+            memory: memory_ptr,
+            size: file_size_u32,
         }
     }
 }

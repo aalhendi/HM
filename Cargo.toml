@@ -1,38 +1,14 @@
-[package]
-name = "hm"
-version = "0.1.0"
-edition = "2024"
-rust-version = "1.93.0"
+[workspace]
+resolver = "2"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
-[dependencies]
-
-[dependencies.windows]
-version = "0.62"
-
-features = [
-    "Data_Xml_Dom",
-    "Win32_Foundation",
-    "Win32_Security",
-    "Win32_System_Threading",
-    "Win32_UI_WindowsAndMessaging",
-    "Win32_Graphics_Gdi",
-    "Win32_System_LibraryLoader",
-    "Win32_System_Memory",
-    "Win32_System_Performance",
-    "Win32_UI_Input_XboxController",
-    "Win32_UI_Input_KeyboardAndMouse",
-    "Win32_Media_Audio_DirectSound",
-    "Win32_Storage_FileSystem",
-    "Win32_System_IO",
+members = [
+    "interface",
+    "win32_platform",
+    "game",
 ]
 
-[lib]
-name = "hm"
-path = "src/lib.rs"
-
-[features]
-internal_build = []
-
-default = ["internal_build"]
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94.1"
+authors = ["aalhendi"]

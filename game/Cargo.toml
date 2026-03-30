@@ -1,0 +1,16 @@
+[package]
+name = "game"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+interface = { path = "../interface", default-features = false }
+
+[lib]
+name = "hm"
+crate-type = ["cdylib"]
+
+[features]
+internal_build = ["interface/internal_build"]
+
+default = ["internal_build"]

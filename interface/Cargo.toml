@@ -1,0 +1,11 @@
+[package]
+name = "interface"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+
+[features]
+internal_build = []
+
+default = ["internal_build"]
