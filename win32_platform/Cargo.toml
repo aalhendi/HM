@@ -6,11 +6,10 @@ edition.workspace = true
 [dependencies]
 interface = { path = "../interface", default-features = false }
 
-[dependencies.windows]
-version = "0.62"
+[dependencies.windows-sys]
+version = "0.61.2"
 
 features = [
-    "Data_Xml_Dom",
     "Win32_Foundation",
     "Win32_Security",
     "Win32_System_Threading",
@@ -21,7 +20,8 @@ features = [
     "Win32_System_Performance",
     "Win32_UI_Input_XboxController",
     "Win32_UI_Input_KeyboardAndMouse",
-    "Win32_Media_Audio_DirectSound",
+    "Win32_Media",
+    "Win32_Media_Audio",
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
 ]

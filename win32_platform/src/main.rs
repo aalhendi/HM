@@ -9,24 +9,18 @@ use interface::{
 #[cfg(feature = "internal_build")]
 use interface::DebugPlatformReadFileResult;
 
-use windows::{
+use windows_sys::{
     Win32::{
         Foundation::{
-            ERROR_SUCCESS, FreeLibrary, HINSTANCE, HMODULE, HWND, LPARAM, LRESULT, RECT, WPARAM,
+            ERROR_SUCCESS, FALSE, FreeLibrary, HANDLE, HINSTANCE, HMODULE, HWND,
+            INVALID_HANDLE_VALUE, LPARAM, LRESULT, RECT, WPARAM,
         },
         Graphics::Gdi::{
             BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BeginPaint, DIB_RGB_COLORS, EndPaint, GetDC, HDC,
             PAINTSTRUCT, SRCCOPY, StretchDIBits,
         },
         Media::{
-            Audio::{
-                DirectSound::{
-                    DSBCAPS_CTRL3D, DSBCAPS_GETCURRENTPOSITION2, DSBCAPS_GLOBALFOCUS,
-                    DSBCAPS_PRIMARYBUFFER, DSBPLAY_LOOPING, DSBUFFERDESC, DSSCL_PRIORITY,
-                    DirectSoundCreate, IDirectSoundBuffer,
-                },
-                WAVE_FORMAT_PCM, WAVEFORMATEX,
-            },
+            Audio::{WAVE_FORMAT_PCM, WAVEFORMATEX},
             TIMERR_NOERROR, timeBeginPeriod,
         },
         Storage::FileSystem::CopyFileA,
@@ -49,7 +43,8 @@ use windows::{
                     XINPUT_GAMEPAD_DPAD_LEFT, XINPUT_GAMEPAD_DPAD_RIGHT, XINPUT_GAMEPAD_DPAD_UP,
                     XINPUT_GAMEPAD_LEFT_SHOULDER, XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE,
                     XINPUT_GAMEPAD_RIGHT_SHOULDER, XINPUT_GAMEPAD_START, XINPUT_GAMEPAD_X,
-                    XINPUT_GAMEPAD_Y, XINPUT_STATE, XInputGetState, XUSER_MAX_COUNT,
+                    XINPUT_GAMEPAD_Y, XINPUT_STATE, XINPUT_VIBRATION, XInputGetState,
+                    XInputSetState, XUSER_MAX_COUNT,
                 },
             },
             WindowsAndMessaging::*,
@@ -150,15 +145,15 @@ fn win32_load_game_code(dll_file_path: PCSTR) -> Win32GameCode {
         // without locking the file which Windows will do if we try to load it directly.
         // TODO(aalhendi): proper path here (cargo run fails because of /target directory)
         // TODO(aalhendi): determine when updates are necessary automatically. (hash?)
-        CopyFileA(dll_file_path, s!("game_temp.dll"), false)
-            .expect("Failed to copy DLL to temp file");
+        // TODO(aalhendi): fallible
+        CopyFileA(dll_file_path, s!("game_temp.dll"), FALSE);
         let game_code_dll_handle = LoadLibraryA(s!("game_temp.dll"));
 
-        if let Ok(handle) = game_code_dll_handle {
-            game_code.game_code_dll = handle;
+        if !game_code_dll_handle.is_null() {
+            game_code.game_code_dll = game_code_dll_handle;
 
-            let update_proc = GetProcAddress(handle, s!("game_update_and_render"));
-            let sound_proc = GetProcAddress(handle, s!("game_get_sound_samples"));
+            let update_proc = GetProcAddress(game_code_dll_handle, s!("game_update_and_render"));
+            let sound_proc = GetProcAddress(game_code_dll_handle, s!("game_get_sound_samples"));
 
             if let (Some(update_ptr), Some(sound_ptr)) = (update_proc, sound_proc) {
                 game_code.update_and_render = mem::transmute::<
@@ -183,7 +178,8 @@ fn win32_load_game_code(dll_file_path: PCSTR) -> Win32GameCode {
 fn win32_unload_game_code(game_code: &mut Win32GameCode) {
     if game_code.game_code_dll != HMODULE::default() {
         unsafe {
-            FreeLibrary(game_code.game_code_dll).expect("Failed to unload DLL");
+            // TODO(aalhendi): fallible
+            FreeLibrary(game_code.game_code_dll);
         }
         game_code.is_valid = false;
         game_code.get_sound_samples = game_get_sound_samples_stub;
@@ -195,8 +191,8 @@ fn win32_unload_game_code(game_code: &mut Win32GameCode) {
 fn win32_get_wall_clock() -> i64 {
     let mut perf_count = 0;
     unsafe {
-        // TODO(aalhendi): handle error
-        QueryPerformanceCounter(&mut perf_count).unwrap();
+        // TODO(aalhendi): handle error. this is fallible
+        QueryPerformanceCounter(&mut perf_count);
         perf_count
     }
 }
@@ -212,77 +208,82 @@ fn win32_get_seconds_elapsed(start: i64, end: i64) -> f64 {
 fn win32_init_dsound(
     window_handle: HWND,
     sound_output: &mut Win32SoundOutput,
-) -> windows::core::Result<(
-    windows::Win32::Media::Audio::DirectSound::IDirectSound,
-    IDirectSoundBuffer,
-    IDirectSoundBuffer,
-)> {
-    let mut ds = None;
-    unsafe {
-        DirectSoundCreate(None, &mut ds, None)?;
-    }
-    if ds.is_none() {
-        panic!("Failed to create direct sound");
-    }
-    let ds = ds.unwrap();
-    unsafe {
-        ds.SetCooperativeLevel(window_handle, DSSCL_PRIORITY)?;
-    }
-    let primary_buffer_desc = DSBUFFERDESC {
-        dwSize: size_of::<DSBUFFERDESC>() as u32,
-        dwFlags: DSBCAPS_PRIMARYBUFFER,
-        dwBufferBytes: 0,
-        dwReserved: 0,
-        // NOTE(aalhendi): we actually can't set the format here, we have to set it later via SetFormat. Windows!
-        lpwfxFormat: ptr::null_mut(),
-        guid3DAlgorithm: GUID::zeroed(),
-    };
+) -> Result<
+    (
+        dsound::LPDIRECTSOUND,
+        dsound::LPDIRECTSOUNDBUFFER,
+        dsound::LPDIRECTSOUNDBUFFER,
+    ),
+    &'static str,
+> {
+    use dsound::*;
 
-    let mut primary_buffer = None;
     unsafe {
-        ds.CreateSoundBuffer(&primary_buffer_desc, &mut primary_buffer, None)?;
-    }
-    if primary_buffer.is_none() {
-        panic!("Failed to create primary buffer");
-    }
-    let primary_buffer = primary_buffer.unwrap();
+        let dsound_lib = LoadLibraryA(s!("dsound.dll"));
+        if dsound_lib == 0 as HMODULE {
+            return Err("Failed to load dsound.dll");
+        }
 
-    let mut wave_format = {
-        let n_channels = 2;
-        let n_block_align = (n_channels * 16) / 8; // TODO(aalhendi): remove hardcoded 16, use sound_output.bytes_per_sample?
-        WAVEFORMATEX {
+        let direct_sound_create: DirectSoundCreateFn =
+            match GetProcAddress(dsound_lib, s!("DirectSoundCreate")) {
+                Some(ds_create_proc) => mem::transmute(ds_create_proc),
+                None => return Err("Failed to get DirectSoundCreate address"),
+            };
+
+        let mut ds: LPDIRECTSOUND = ptr::null_mut();
+        if !SUCCEEDED(direct_sound_create(ptr::null(), &mut ds, ptr::null_mut())) {
+            return Err("DirectSoundCreate failed");
+        }
+
+        if !SUCCEEDED((*ds).SetCooperativeLevel(window_handle, DSSCL_PRIORITY)) {
+            return Err("SetCooperativeLevel failed");
+        }
+
+        let primary_buffer_desc = DSBUFFERDESC {
+            dwSize: size_of::<DSBUFFERDESC>() as u32,
+            dwFlags: DSBCAPS_PRIMARYBUFFER,
+            dwBufferBytes: 0,
+            dwReserved: 0,
+            // NOTE(aalhendi): we actually can't set the format here, we have to set it later via SetFormat. Windows!
+            lpwfxFormat: ptr::null_mut(),
+            guid3DAlgorithm: GUID::default(),
+        };
+
+        let mut primary_buffer: LPDIRECTSOUNDBUFFER = ptr::null_mut();
+        if !SUCCEEDED((*ds).CreateSoundBuffer(&primary_buffer_desc, &mut primary_buffer)) {
+            return Err("CreateSoundBuffer (Primary) failed");
+        }
+
+        let mut wave_format = WAVEFORMATEX {
             wFormatTag: WAVE_FORMAT_PCM as u16,
-            nChannels: n_channels,
-            nBlockAlign: n_block_align,
+            nChannels: 2,
+            nBlockAlign: 4, // (nChannels * 16) /8
             nSamplesPerSec: sound_output.samples_per_second,
-            nAvgBytesPerSec: sound_output.samples_per_second * n_block_align as u32,
+            nAvgBytesPerSec: sound_output.samples_per_second * 4, // 4 is nBlockAlign // TODO(aalhendi): remove hardcoded 16, use sound_output.bytes_per_sample?
             wBitsPerSample: 16, // TODO(aalhendi): remove hardcoded 16, use sound_output.bytes_per_sample?
             cbSize: 0,
+        };
+
+        if !SUCCEEDED((*primary_buffer).SetFormat(&wave_format)) {
+            return Err("SetFormat (Primary) failed");
         }
-    };
-    unsafe {
-        primary_buffer.SetFormat(&wave_format)?;
-    }
 
-    let secondary_buffer_desc = DSBUFFERDESC {
-        dwSize: size_of::<DSBUFFERDESC>() as u32,
-        dwFlags: DSBCAPS_GETCURRENTPOSITION2 | DSBCAPS_GLOBALFOCUS | DSBCAPS_CTRL3D,
-        dwBufferBytes: sound_output.buffer_size,
-        dwReserved: 0,
-        lpwfxFormat: &mut wave_format,
-        guid3DAlgorithm: GUID::zeroed(),
-    };
+        let secondary_buffer_desc = DSBUFFERDESC {
+            dwSize: size_of::<DSBUFFERDESC>() as u32,
+            dwFlags: DSBCAPS_GETCURRENTPOSITION2 | DSBCAPS_GLOBALFOCUS | DSBCAPS_CTRL3D,
+            dwBufferBytes: sound_output.buffer_size,
+            dwReserved: 0,
+            lpwfxFormat: &mut wave_format,
+            guid3DAlgorithm: GUID::default(),
+        };
 
-    let mut secondary_buffer = None;
-    unsafe {
-        ds.CreateSoundBuffer(&secondary_buffer_desc, &mut secondary_buffer, None)?;
-    }
-    if secondary_buffer.is_none() {
-        panic!("Failed to create secondary buffer");
-    }
-    let secondary_buffer = secondary_buffer.unwrap();
+        let mut secondary_buffer: LPDIRECTSOUNDBUFFER = ptr::null_mut();
+        if !SUCCEEDED((*ds).CreateSoundBuffer(&secondary_buffer_desc, &mut secondary_buffer)) {
+            return Err("CreateSoundBuffer (Secondary) failed");
+        }
 
-    Ok((ds, primary_buffer, secondary_buffer))
+        Ok((ds, primary_buffer, secondary_buffer))
+    }
 }
 
 #[derive(Default, Copy, Clone)]
@@ -324,58 +325,45 @@ impl Win32SoundOutput {
 }
 
 fn win32_clear_sound_buffer(
-    secondary_buffer: &IDirectSoundBuffer,
+    secondary_buffer: dsound::LPDIRECTSOUNDBUFFER,
     sound_output: &mut Win32SoundOutput,
-) -> windows::core::Result<()> {
+) {
     // To be filled by Lock:
     let mut region1_ptr: *mut ffi::c_void = ptr::null_mut();
     let mut region1_size: u32 = 0;
     let mut region2_ptr: *mut ffi::c_void = ptr::null_mut();
     let mut region2_size: u32 = 0;
     unsafe {
-        secondary_buffer.Lock(
+        if dsound::SUCCEEDED((*secondary_buffer).Lock(
             0,
             sound_output.buffer_size,
             &mut region1_ptr,
             &mut region1_size,
-            Some(&mut region2_ptr),
-            Some(&mut region2_size),
+            &mut region2_ptr,
+            &mut region2_size,
             0,
-        )?;
-    }
+        )) {
+            ptr::write_bytes(region1_ptr as *mut u8, 0, region1_size as usize);
+            // NOTE(aalhendi): region2 is not null if we are wrapping around the ring buffer... and we expect a contiguous region at startup so this will rarely be hit.
+            if !region2_ptr.is_null() {
+                ptr::write_bytes(region2_ptr as *mut u8, 0, region2_size as usize);
+            }
 
-    let mut dest_sample = region1_ptr as *mut u8;
-    for _byte_index in 0..region1_size {
-        unsafe {
-            *dest_sample = 0;
-            dest_sample = dest_sample.offset(1);
+            (*secondary_buffer).Unlock(region1_ptr, region1_size, region2_ptr, region2_size); // TODO(aalhendi): can fail?
+        } else {
+            panic!("Secondary buffer Lock failed");
         }
     }
-
-    // NOTE(aalhendi): region2 is not null if we are wrapping around the ring buffer... and we expect a contiguous region at startup so this will rarely be hit.
-    dest_sample = region2_ptr as *mut u8;
-    for _byte_index in 0..region2_size {
-        unsafe {
-            *dest_sample = 0;
-            dest_sample = dest_sample.offset(1);
-        }
-    }
-
-    unsafe {
-        secondary_buffer.Unlock(region1_ptr, region1_size, None, 0)?;
-    }
-
-    Ok(())
 }
 
 fn win32_fill_sound_buffer(
     // note(aalhendi): this is meant to be a "global" secondary buffer, but we are passing it in as an argument for now
-    secondary_buffer: &IDirectSoundBuffer,
+    secondary_buffer: dsound::LPDIRECTSOUNDBUFFER,
     sound_output: &mut Win32SoundOutput,
     bytes_to_lock: u32,
     bytes_to_write: u32,
     source_buffer: &mut GameSoundOutputBuffer,
-) -> windows::core::Result<()> {
+) {
     // To be filled by Lock:
     let mut region1_ptr: *mut ffi::c_void = ptr::null_mut();
     let mut region1_size: u32 = 0;
@@ -383,70 +371,54 @@ fn win32_fill_sound_buffer(
     let mut region2_size: u32 = 0;
 
     unsafe {
-        secondary_buffer.Lock(
+        if dsound::SUCCEEDED((*secondary_buffer).Lock(
             bytes_to_lock,
             bytes_to_write,
             &mut region1_ptr,
             &mut region1_size,
-            Some(&mut region2_ptr),
-            Some(&mut region2_size),
+            &mut region2_ptr,
+            &mut region2_size,
             0,
-        )?;
-    }
+        )) {
+            // TODO(aalhendi): assert that region1_size , region2_size are valid
+            let region1_sample_count = region1_size / sound_output.bytes_per_sample;
+            let mut dest_sample = region1_ptr as *mut i16;
+            let mut source_sample = source_buffer.samples;
 
-    // TODO(aalhendi): assert that region1_size , region2_size are valid
-
-    let region1_sample_count = region1_size / sound_output.bytes_per_sample;
-    let mut dest_sample = region1_ptr as *mut i16;
-    let mut source_sample = source_buffer.samples;
-    for _sample_index in 0..region1_sample_count {
-        // basically, we write L/R L/R L/R L/R etc.
-        // we use sample_out as an i16 ptr to the memory location we want to write to (region1 / ringbuffer)
-        unsafe {
-            *dest_sample = *source_sample;
-            source_sample = source_sample.offset(1);
-            dest_sample = dest_sample.offset(1);
-            *dest_sample = *source_sample;
-            source_sample = source_sample.offset(1);
-            dest_sample = dest_sample.offset(1);
-        }
-        sound_output.running_sample_index = sound_output.running_sample_index.overflowing_add(1).0;
-    }
-
-    // in the case where we are wrapping around the ring buffer, we need to fill region2
-    // todo(aalhendi): same loop as above, but for region2, can we collapse the 2 loops?
-    if !region2_ptr.is_null() {
-        let region2_sample_count = region2_size / sound_output.bytes_per_sample;
-        dest_sample = region2_ptr as *mut i16;
-        for _sample_index in 0..region2_sample_count {
-            unsafe {
+            for _ in 0..region1_sample_count {
+                // basically, we write L/R L/R L/R L/R etc.
+                // we use sample_out as an i16 ptr to the memory location we want to write to (region1 / ringbuffer)
                 *dest_sample = *source_sample;
-                source_sample = source_sample.offset(1);
-                dest_sample = dest_sample.offset(1);
+                dest_sample = dest_sample.add(1);
+                source_sample = source_sample.add(1);
                 *dest_sample = *source_sample;
-                source_sample = source_sample.offset(1);
-                dest_sample = dest_sample.offset(1);
+                dest_sample = dest_sample.add(1);
+                source_sample = source_sample.add(1);
+                sound_output.running_sample_index =
+                    sound_output.running_sample_index.wrapping_add(1);
             }
-            sound_output.running_sample_index =
-                sound_output.running_sample_index.overflowing_add(1).0;
+
+            // in the case where we are wrapping around the ring buffer, we need to fill region2
+            // todo(aalhendi): same loop as above, but for region2, can we collapse the 2 loops?
+            if !region2_ptr.is_null() {
+                let region2_sample_count = region2_size / sound_output.bytes_per_sample;
+                dest_sample = region2_ptr as *mut i16;
+                for _ in 0..region2_sample_count {
+                    *dest_sample = *source_sample;
+                    dest_sample = dest_sample.add(1);
+                    source_sample = source_sample.add(1);
+                    *dest_sample = *source_sample;
+                    dest_sample = dest_sample.add(1);
+                    source_sample = source_sample.add(1);
+                    sound_output.running_sample_index =
+                        sound_output.running_sample_index.wrapping_add(1);
+                }
+            }
+
+            (*secondary_buffer).Unlock(region1_ptr, region1_size, region2_ptr, region2_size);
+        } else {
+            panic!("Secondary buffer Lock failed");
         }
-    }
-
-    // for some reason, unlock expects a different signature than lock... so we have to do this
-    // refactor(aalhendi): we can have 2 unlock calls, one running if region2_ptr is null, and the other running if it is not null after write is done.
-    let (final_ptr_region2, final_size_region2) = if region2_ptr.is_null() {
-        (None, 0)
-    } else {
-        (Some(region2_ptr as *const ffi::c_void), region2_size)
-    };
-
-    unsafe {
-        secondary_buffer.Unlock(
-            region1_ptr as *const ffi::c_void,
-            region1_size,
-            final_ptr_region2,
-            final_size_region2,
-        )
     }
 }
 
@@ -533,7 +505,7 @@ impl Win32OffscreenBuffer {
                 0,
                 self.width,
                 self.height,
-                Some(self.memory),
+                self.memory,
                 &self.info,
                 DIB_RGB_COLORS,
                 SRCCOPY,
@@ -545,8 +517,9 @@ impl Win32OffscreenBuffer {
     unsafe fn win32_resize_dib_section(&mut self, width: i32, height: i32) {
         if self.memory != unsafe { mem::zeroed() } {
             let free_res = unsafe { VirtualFree(self.memory, 0, MEM_RELEASE) };
-            if let Err(e) = free_res {
-                panic!("{e}");
+            // TODO(aalhendi): check result
+            if free_res == FALSE {
+                panic!("Failed to free memory");
             }
         }
 
@@ -560,7 +533,7 @@ impl Win32OffscreenBuffer {
             biHeight: -self.height,
             biPlanes: 1,
             biBitCount: 32, // 8 for red, 8 for green, 8 for blue, ask for 32 for DWORD alignment
-            biCompression: BI_RGB.0, // Uncompressed
+            biCompression: BI_RGB, // Uncompressed
             biSizeImage: 0,
             biXPelsPerMeter: 0,
             biYPelsPerMeter: 0,
@@ -573,7 +546,7 @@ impl Win32OffscreenBuffer {
         let bitmap_memory_size = (self.bytes_per_pixel * self.width * self.height) as usize;
         self.memory = unsafe {
             VirtualAlloc(
-                None,
+                ptr::null(),
                 bitmap_memory_size,
                 MEM_RESERVE | MEM_COMMIT,
                 PAGE_READWRITE,
@@ -684,11 +657,13 @@ impl Win32OffscreenBuffer {
     }
 }
 
-fn main() -> windows::core::Result<()> {
+fn main() {
     unsafe {
-        let module_handle = GetModuleHandleA(None)?;
+        // TODO(aalhendi): fallible
+        let module_handle = GetModuleHandleA(ptr::null());
 
-        QueryPerformanceFrequency(&mut PERF_COUNT_FREQUENCY)?;
+        // TODO(aalhendi): fallible
+        QueryPerformanceFrequency(&mut PERF_COUNT_FREQUENCY);
 
         // NOTE(aalhendi): Set windows scheduler granularity. This is used to make our sleep more accurate (granular).
         let desired_scheduler_ms = 1;
@@ -699,12 +674,15 @@ fn main() -> windows::core::Result<()> {
 
         GLOBAL_BACKBUFFER.win32_resize_dib_section(1280, 720);
 
+        // TODO(aalhendi): getmodulehandlea check result fallible
+        let instance = HINSTANCE::from(GetModuleHandleA(ptr::null()));
+
         let wc = WNDCLASSA {
             style: CS_HREDRAW | CS_VREDRAW | CS_OWNDC,
             lpfnWndProc: Some(win32_main_window_callback),
-            hInstance: GetModuleHandleA(None)?.into(),
+            hInstance: instance,
             lpszClassName: s!("HandmadeHeroWindowClass"),
-            hCursor: LoadCursorW(None, IDC_ARROW)?,
+            hCursor: LoadCursorW(ptr::null_mut(), IDC_ARROW), // fallible
             ..Default::default()
         };
 
@@ -715,6 +693,7 @@ fn main() -> windows::core::Result<()> {
         }
         debug_assert!(atom != 0);
 
+        // TODO(aalhendi): fallible
         let window_handle = CreateWindowExA(
             WINDOW_EX_STYLE::default(), // 0
             wc.lpszClassName,
@@ -724,14 +703,14 @@ fn main() -> windows::core::Result<()> {
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
-            None,
-            None,
-            Some(HINSTANCE::from(module_handle)),
-            None,
-        )?;
+            ptr::null_mut(),
+            ptr::null_mut(),
+            HINSTANCE::from(module_handle),
+            ptr::null(),
+        );
 
         // NOTE(aalhendi): By using CS_OWNDC, can get one device context and keep using it forever since it is not shared.
-        let device_context = GetDC(Some(window_handle));
+        let device_context = GetDC(window_handle);
 
         // NOTE(aalhendi): Audio test
         // TODO(aalhendi): make this sixty seconds?
@@ -739,10 +718,16 @@ fn main() -> windows::core::Result<()> {
 
         // can't load direct sound till we have a window handle
         let (_ds, _primary_buffer, secondary_buffer) =
-            win32_init_dsound(window_handle, &mut sound_output)?;
+            match win32_init_dsound(window_handle, &mut sound_output) {
+                Ok(ds_and_primary_buffer) => ds_and_primary_buffer,
+                Err(e) => {
+                    eprintln!("Failed to initialize DirectSound: {e}");
+                    return;
+                }
+            };
 
-        win32_clear_sound_buffer(&secondary_buffer, &mut sound_output)?;
-        secondary_buffer.Play(0, 0, DSBPLAY_LOOPING)?;
+        win32_clear_sound_buffer(secondary_buffer, &mut sound_output);
+        (*secondary_buffer).Play(0, 0, dsound::DSBPLAY_LOOPING); // TODO(aalhendi): fallible
 
         GLOBAL_RUNNING = true;
 
@@ -760,7 +745,7 @@ fn main() -> windows::core::Result<()> {
 
         // TODO(aalhendi): pool with bitmap VirtualAlloc
         let samples = VirtualAlloc(
-            None,
+            ptr::null(),
             sound_output.buffer_size as usize,
             MEM_RESERVE | MEM_COMMIT,
             PAGE_READWRITE,
@@ -783,7 +768,7 @@ fn main() -> windows::core::Result<()> {
         };
 
         let permanent_storage = VirtualAlloc(
-            Some(base_address as *mut ffi::c_void),
+            base_address as *mut ffi::c_void,
             total_storage_size,
             MEM_RESERVE | MEM_COMMIT,
             PAGE_READWRITE,
@@ -834,7 +819,7 @@ fn main() -> windows::core::Result<()> {
         let mut audio_latency_sec;
         let mut is_sound_valid = false;
 
-        let mut game = win32_load_game_code(PCSTR::from_raw(c"hm.dll".as_ptr().cast::<u8>()));
+        let mut game = win32_load_game_code(s!("hm.dll"));
         let mut load_counter = 0;
 
         // TODO(aalhendi): do we want to use rdtscp instead?
@@ -843,7 +828,7 @@ fn main() -> windows::core::Result<()> {
         while GLOBAL_RUNNING {
             if load_counter > 120 {
                 win32_unload_game_code(&mut game);
-                game = win32_load_game_code(PCSTR::from_raw(c"hm.dll".as_ptr().cast::<u8>()));
+                game = win32_load_game_code(s!("hm.dll"));
 
                 load_counter = 0;
             } else {
@@ -874,7 +859,7 @@ fn main() -> windows::core::Result<()> {
 
                     let mut controller_state: XINPUT_STATE = XINPUT_STATE::default();
                     let x_input_state_res = XInputGetState(controller_index, &mut controller_state);
-                    if x_input_state_res == ERROR_SUCCESS.0 {
+                    if x_input_state_res == ERROR_SUCCESS {
                         new_controller.is_connected = true;
 
                         // NOTE(aalhendi): This controller is connected
@@ -883,13 +868,13 @@ fn main() -> windows::core::Result<()> {
 
                         let stick_left_x = win32_process_x_input_stick_value(
                             pad.sThumbLX,
-                            XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE.0 as i16,
+                            XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE as i16,
                         );
                         new_controller.left_stick_average_x = stick_left_x;
 
                         let stick_left_y = win32_process_x_input_stick_value(
                             pad.sThumbLY,
-                            XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE.0 as i16,
+                            XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE as i16,
                         );
                         new_controller.left_stick_average_y = stick_left_y;
 
@@ -899,19 +884,19 @@ fn main() -> windows::core::Result<()> {
 
                         // TODO(aalhendi): add right stick support
 
-                        if (pad.wButtons & XINPUT_GAMEPAD_DPAD_UP).0 != 0 {
+                        if (pad.wButtons & XINPUT_GAMEPAD_DPAD_UP) != 0 {
                             new_controller.is_analog = false;
                             new_controller.left_stick_average_y = 1.0;
                         }
-                        if (pad.wButtons & XINPUT_GAMEPAD_DPAD_DOWN).0 != 0 {
+                        if (pad.wButtons & XINPUT_GAMEPAD_DPAD_DOWN) != 0 {
                             new_controller.is_analog = false;
                             new_controller.left_stick_average_y = -1.0;
                         }
-                        if (pad.wButtons & XINPUT_GAMEPAD_DPAD_LEFT).0 != 0 {
+                        if (pad.wButtons & XINPUT_GAMEPAD_DPAD_LEFT) != 0 {
                             new_controller.is_analog = false;
                             new_controller.left_stick_average_x = 1.0;
                         }
-                        if (pad.wButtons & XINPUT_GAMEPAD_DPAD_RIGHT).0 != 0 {
+                        if (pad.wButtons & XINPUT_GAMEPAD_DPAD_RIGHT) != 0 {
                             new_controller.is_analog = false;
                             new_controller.left_stick_average_x = -1.0;
                         }
@@ -919,7 +904,7 @@ fn main() -> windows::core::Result<()> {
                         let threshold = 0.5_f32;
                         // NOTE(aalhendi): fake dpad emulation from left stick
                         win32_process_x_input_digital_button(
-                            XINPUT_GAMEPAD_BUTTON_FLAGS(
+                            XINPUT_GAMEPAD_BUTTON_FLAGS::from(
                                 (new_controller.left_stick_average_x < -threshold) as u16,
                             ),
                             old_controller.button_mut(GameButton::MoveLeft),
@@ -927,7 +912,7 @@ fn main() -> windows::core::Result<()> {
                             new_controller.button_mut(GameButton::MoveLeft),
                         );
                         win32_process_x_input_digital_button(
-                            XINPUT_GAMEPAD_BUTTON_FLAGS(
+                            XINPUT_GAMEPAD_BUTTON_FLAGS::from(
                                 (new_controller.left_stick_average_x > threshold) as u16,
                             ),
                             old_controller.button_mut(GameButton::MoveRight),
@@ -935,7 +920,7 @@ fn main() -> windows::core::Result<()> {
                             new_controller.button_mut(GameButton::MoveRight),
                         );
                         win32_process_x_input_digital_button(
-                            XINPUT_GAMEPAD_BUTTON_FLAGS(
+                            XINPUT_GAMEPAD_BUTTON_FLAGS::from(
                                 (new_controller.left_stick_average_y < -threshold) as u16,
                             ),
                             old_controller.button_mut(GameButton::MoveUp),
@@ -943,7 +928,7 @@ fn main() -> windows::core::Result<()> {
                             new_controller.button_mut(GameButton::MoveUp),
                         );
                         win32_process_x_input_digital_button(
-                            XINPUT_GAMEPAD_BUTTON_FLAGS(
+                            XINPUT_GAMEPAD_BUTTON_FLAGS::from(
                                 (new_controller.left_stick_average_y > threshold) as u16,
                             ),
                             old_controller.button_mut(GameButton::MoveDown),
@@ -1013,13 +998,11 @@ fn main() -> windows::core::Result<()> {
                 }
 
                 // Test out vibration
-                windows::Win32::UI::Input::XboxController::XInputSetState(
-                    0,
-                    &windows::Win32::UI::Input::XboxController::XINPUT_VIBRATION {
-                        wLeftMotorSpeed: 65535,
-                        wRightMotorSpeed: 65535,
-                    },
-                );
+                let vibration = XINPUT_VIBRATION {
+                    wLeftMotorSpeed: 65535,
+                    wRightMotorSpeed: 65535,
+                };
+                XInputSetState(0, &vibration);
 
                 let mut buffer = GameOffscreenBuffer {
                     width: GLOBAL_BACKBUFFER.width,
@@ -1052,113 +1035,104 @@ fn main() -> windows::core::Result<()> {
                 let mut play_cursor = 0_u32;
                 let mut write_cursor = 0_u32;
 
-                match secondary_buffer
-                    .GetCurrentPosition(Some(&mut play_cursor), Some(&mut write_cursor))
-                {
-                    Ok(_) => {
-                        if !is_sound_valid {
-                            sound_output.running_sample_index =
-                                write_cursor / sound_output.bytes_per_sample;
-                            is_sound_valid = true;
-                        }
-
-                        // lock offset
-                        let bytes_to_lock = sound_output
-                            .running_sample_index
-                            .overflowing_mul(sound_output.bytes_per_sample)
-                            .0
-                            % sound_output.buffer_size;
-
-                        let expected_sound_bytes_per_frame = (sound_output.samples_per_second
-                            * sound_output.bytes_per_sample)
-                            / GAME_UPDATE_HZ as u32;
-                        let seconds_left_until_flip =
-                            TARGET_SECONDS_PER_FRAME - from_begin_to_audio_seconds;
-                        let expected_bytes_until_flip = ((seconds_left_until_flip
-                            / TARGET_SECONDS_PER_FRAME)
-                            * expected_sound_bytes_per_frame as f64)
-                            as u32;
-                        let expected_frame_boundary_byte = play_cursor + expected_bytes_until_flip;
-                        let safe_write_cursor = if write_cursor < play_cursor {
-                            write_cursor + sound_output.buffer_size + sound_output.safety_bytes
-                        } else {
-                            write_cursor + sound_output.safety_bytes
-                        };
-                        debug_assert!(safe_write_cursor - sound_output.safety_bytes >= play_cursor);
-                        let is_low_latency_audio_card =
-                            safe_write_cursor < expected_frame_boundary_byte;
-
-                        // lock size
-                        let target_write_cursor = if is_low_latency_audio_card {
-                            (expected_frame_boundary_byte + expected_sound_bytes_per_frame)
-                                % sound_output.buffer_size
-                        } else {
-                            (write_cursor
-                                + expected_sound_bytes_per_frame
-                                + sound_output.safety_bytes)
-                                % sound_output.buffer_size
-                        };
-                        let bytes_to_write = if bytes_to_lock > target_write_cursor {
-                            // case 1: we are wrapping around the ring buffer, fill 2 regions
-                            (sound_output.buffer_size - bytes_to_lock) + target_write_cursor
-                        } else {
-                            // case 2: we are not wrapping around the ring buffer, fill 1 region
-                            target_write_cursor - bytes_to_lock
-                        };
-
-                        #[cfg(feature = "internal_build")]
-                        {
-                            let current_debug_marker =
-                                &mut debug_time_markers[debug_time_marker_idx];
-
-                            current_debug_marker.output_play_cursor = play_cursor;
-                            current_debug_marker.output_write_cursor = write_cursor;
-                            current_debug_marker.output_location = bytes_to_lock;
-                            current_debug_marker.output_byte_count = bytes_to_write;
-                            current_debug_marker.expected_flip_play_cursor =
-                                expected_frame_boundary_byte;
-
-                            let unwrapped_write_cursor = if write_cursor < play_cursor {
-                                write_cursor + sound_output.buffer_size
-                            } else {
-                                write_cursor
-                            };
-
-                            audio_latency_bytes = unwrapped_write_cursor - play_cursor;
-                            audio_latency_sec = (audio_latency_bytes as f32
-                                / sound_output.bytes_per_sample as f32)
-                                / sound_output.samples_per_second as f32;
-
-                            println!(
-                                "BTL:{bytes_to_lock} TC:{target_write_cursor} BTW:{bytes_to_write} - PC:{play_cursor} WC:{write_cursor} DELTA:{audio_latency_bytes} ({audio_latency_sec:.3}s)"
-                            );
-                        }
-
-                        let mut sound_buffer = GameSoundOutputBuffer {
-                            samples_per_second: sound_output.samples_per_second,
-                            sample_count: bytes_to_write / sound_output.bytes_per_sample,
-                            samples,
-                        };
-                        (game.get_sound_samples)(&mut game_memory, &mut sound_buffer);
-
-                        // NOTE(aalhendi): ideally, we want to only fill sound buffer if there's something to write.
-                        // this fn calls Lock(), which can fail if bytes_to_write is 0,
-                        // we are ignoring the error for now, skipping this frame if it fails. This is to match C behavior.
-                        // from testing, this only happens the first time the call occurs. we could have an if check to see if bytes_to_write is 0,
-                        // but that check would run every frame, which is not ideal.
-                        if let Err(e) = win32_fill_sound_buffer(
-                            &secondary_buffer,
-                            &mut sound_output,
-                            bytes_to_lock,
-                            bytes_to_write,
-                            &mut sound_buffer,
-                        ) {
-                            println!("Error filling sound buffer: {e:?}");
-                        }
+                if dsound::SUCCEEDED(
+                    (*secondary_buffer).GetCurrentPosition(&mut play_cursor, &mut write_cursor),
+                ) {
+                    if !is_sound_valid {
+                        sound_output.running_sample_index =
+                            write_cursor / sound_output.bytes_per_sample;
+                        is_sound_valid = true;
                     }
-                    Err(_) => {
-                        is_sound_valid = false;
+
+                    // lock offset
+                    let bytes_to_lock = sound_output
+                        .running_sample_index
+                        .overflowing_mul(sound_output.bytes_per_sample)
+                        .0
+                        % sound_output.buffer_size;
+
+                    let expected_sound_bytes_per_frame = (sound_output.samples_per_second
+                        * sound_output.bytes_per_sample)
+                        / GAME_UPDATE_HZ as u32;
+                    let seconds_left_until_flip =
+                        TARGET_SECONDS_PER_FRAME - from_begin_to_audio_seconds;
+                    let expected_bytes_until_flip =
+                        ((seconds_left_until_flip / TARGET_SECONDS_PER_FRAME)
+                            * expected_sound_bytes_per_frame as f64) as u32;
+                    let expected_frame_boundary_byte = play_cursor + expected_bytes_until_flip;
+                    let safe_write_cursor = if write_cursor < play_cursor {
+                        write_cursor + sound_output.buffer_size + sound_output.safety_bytes
+                    } else {
+                        write_cursor + sound_output.safety_bytes
+                    };
+                    debug_assert!(safe_write_cursor - sound_output.safety_bytes >= play_cursor);
+                    let is_low_latency_audio_card =
+                        safe_write_cursor < expected_frame_boundary_byte;
+
+                    // lock size
+                    let target_write_cursor = if is_low_latency_audio_card {
+                        (expected_frame_boundary_byte + expected_sound_bytes_per_frame)
+                            % sound_output.buffer_size
+                    } else {
+                        (write_cursor + expected_sound_bytes_per_frame + sound_output.safety_bytes)
+                            % sound_output.buffer_size
+                    };
+                    let bytes_to_write = if bytes_to_lock > target_write_cursor {
+                        // case 1: we are wrapping around the ring buffer, fill 2 regions
+                        (sound_output.buffer_size - bytes_to_lock) + target_write_cursor
+                    } else {
+                        // case 2: we are not wrapping around the ring buffer, fill 1 region
+                        target_write_cursor - bytes_to_lock
+                    };
+
+                    #[cfg(feature = "internal_build")]
+                    {
+                        let current_debug_marker = &mut debug_time_markers[debug_time_marker_idx];
+
+                        current_debug_marker.output_play_cursor = play_cursor;
+                        current_debug_marker.output_write_cursor = write_cursor;
+                        current_debug_marker.output_location = bytes_to_lock;
+                        current_debug_marker.output_byte_count = bytes_to_write;
+                        current_debug_marker.expected_flip_play_cursor =
+                            expected_frame_boundary_byte;
+
+                        let unwrapped_write_cursor = if write_cursor < play_cursor {
+                            write_cursor + sound_output.buffer_size
+                        } else {
+                            write_cursor
+                        };
+
+                        audio_latency_bytes = unwrapped_write_cursor - play_cursor;
+                        audio_latency_sec = (audio_latency_bytes as f32
+                            / sound_output.bytes_per_sample as f32)
+                            / sound_output.samples_per_second as f32;
+
+                        println!(
+                            "BTL:{bytes_to_lock} TC:{target_write_cursor} BTW:{bytes_to_write} - PC:{play_cursor} WC:{write_cursor} DELTA:{audio_latency_bytes} ({audio_latency_sec:.3}s)"
+                        );
                     }
+
+                    let mut sound_buffer = GameSoundOutputBuffer {
+                        samples_per_second: sound_output.samples_per_second,
+                        sample_count: bytes_to_write / sound_output.bytes_per_sample,
+                        samples,
+                    };
+                    (game.get_sound_samples)(&mut game_memory, &mut sound_buffer);
+
+                    // NOTE(aalhendi): ideally, we want to only fill sound buffer if there's something to write.
+                    // this fn calls Lock(), which can fail if bytes_to_write is 0,
+                    // we are ignoring the error for now, skipping this frame if it fails. This is to match C behavior.
+                    // from testing, this only happens the first time the call occurs. we could have an if check to see if bytes_to_write is 0,
+                    // but that check would run every frame, which is not ideal.
+                    win32_fill_sound_buffer(
+                        secondary_buffer,
+                        &mut sound_output,
+                        bytes_to_lock,
+                        bytes_to_write,
+                        &mut sound_buffer,
+                    );
+                } else {
+                    is_sound_valid = false;
                 }
 
                 // TODO(aalhendi): NOT TESTED YET!
@@ -1173,7 +1147,7 @@ fn main() -> windows::core::Result<()> {
                                 (TARGET_SECONDS_PER_FRAME - seconds_elapsed_for_frame) * 1000_f64;
                             if sleep_ms > 1_f64 {
                                 // TODO(aalhendi): sleeping is hard... see Intel's TPAUSE instruction. I think AMD uses UMWAIT.
-                                windows::Win32::System::Threading::Sleep(sleep_ms as u32);
+                                windows_sys::Win32::System::Threading::Sleep(sleep_ms as u32);
                             }
                         }
 
@@ -1229,8 +1203,11 @@ fn main() -> windows::core::Result<()> {
                     // NOTE(aalhendi): This is debug code
                     let mut play_cursor = 0_u32;
                     let mut write_cursor = 0_u32;
-                    secondary_buffer
-                        .GetCurrentPosition(Some(&mut play_cursor), Some(&mut write_cursor))?;
+                    if !dsound::SUCCEEDED(
+                        (*secondary_buffer).GetCurrentPosition(&mut play_cursor, &mut write_cursor),
+                    ) {
+                        panic!("Failed to get current position from secondary buffer");
+                    }
                     debug_assert!(debug_time_marker_idx <= debug_time_markers.len());
                     let current_debug_marker = &mut debug_time_markers[debug_time_marker_idx];
 
@@ -1257,28 +1234,26 @@ fn main() -> windows::core::Result<()> {
                 );
             }
         }
-
-        Ok(())
     }
 }
 
 unsafe fn win32_process_pending_messages(keyboard_controller: &mut GameControllerInput) {
     let mut message = MSG::default();
-    while unsafe { PeekMessageA(&mut message, None, 0, 0, PM_REMOVE).as_bool() } {
+    while unsafe { PeekMessageA(&mut message, ptr::null_mut(), 0, 0, PM_REMOVE) != FALSE } {
         match message.message {
             WM_QUIT => unsafe {
                 GLOBAL_RUNNING = false;
             },
             WM_KEYDOWN | WM_KEYUP | WM_SYSKEYDOWN | WM_SYSKEYUP => {
                 let virtual_key_code = message.wParam;
-                let was_down = (message.lParam.0 & (1 << KEY_MESSAGE_WAS_DOWN_BIT)) != 0;
-                let is_down = (message.lParam.0 & (1 << KEY_MESSAGE_IS_DOWN_BIT)) == 0;
-                let is_alt_down = (message.lParam.0 & (1 << KEY_MESSAGE_IS_ALT_BIT)) != 0;
+                let was_down = (message.lParam & (1 << KEY_MESSAGE_WAS_DOWN_BIT)) != 0;
+                let is_down = (message.lParam & (1 << KEY_MESSAGE_IS_DOWN_BIT)) == 0;
+                let is_alt_down = (message.lParam & (1 << KEY_MESSAGE_IS_ALT_BIT)) != 0;
                 if was_down != is_down {
                     #[allow(unreachable_patterns)]
                     #[allow(unused_variables)]
                     #[allow(non_snake_case)]
-                    match VIRTUAL_KEY(virtual_key_code.0 as u16) {
+                    match VIRTUAL_KEY::from(virtual_key_code as u16) {
                         VK_W => win32_process_keyboard_message(
                             keyboard_controller.button_mut(GameButton::MoveUp),
                             is_down,
@@ -1365,24 +1340,24 @@ extern "system" fn win32_main_window_callback(
             WM_CLOSE => {
                 // TODO(aalhendi): Handle this with a message to the user?
                 GLOBAL_RUNNING = false;
-                LRESULT(0)
+                LRESULT::from(0_isize)
             }
             WM_DESTROY => {
                 // TODO(aalhendi): Handle this as an error - recreate window?
                 GLOBAL_RUNNING = false;
-                LRESULT(0)
+                LRESULT::from(0_isize)
             }
             WM_KEYDOWN | WM_KEYUP | WM_SYSKEYDOWN | WM_SYSKEYUP => {
                 debug_assert!(
                     false,
                     "Keyboard input came in through a non-dispatch event. This should not happen. Means it likely came through via callback."
                 );
-                LRESULT(0)
+                LRESULT::from(0_isize)
             }
 
             WM_ACTIVATEAPP => {
                 println!("WM_ACTIVATE");
-                LRESULT(0)
+                LRESULT::from(0_isize)
             }
             WM_PAINT => {
                 let mut paint = PAINTSTRUCT::default();
@@ -1394,7 +1369,7 @@ extern "system" fn win32_main_window_callback(
                     dims.height,
                 );
                 let _ = EndPaint(window, &paint);
-                LRESULT(0)
+                LRESULT::from(0_isize)
             }
             _ => DefWindowProcA(window, message, wparam, lparam),
         }
@@ -1422,34 +1397,37 @@ pub extern "C" fn debug_platform_write_entire_file(
     memory: *mut ffi::c_void,
 ) -> bool {
     unsafe {
-        use windows::Win32::{
+        use windows_sys::Win32::{
             Foundation::{CloseHandle, GENERIC_WRITE},
             Storage::FileSystem::{
                 CREATE_ALWAYS, CreateFileA, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_NONE, WriteFile,
             },
         };
 
-        let filename = PCSTR::from_raw(filename.cast::<u8>());
-        let file_handle = match CreateFileA(
+        let filename = PCSTR::from(filename.cast::<u8>());
+        let file_handle = CreateFileA(
             filename,
-            GENERIC_WRITE.0,
+            GENERIC_WRITE,
             FILE_SHARE_NONE,
-            None,
+            ptr::null(),
             CREATE_ALWAYS,
             FILE_ATTRIBUTE_NORMAL,
-            None,
-        ) {
-            Ok(handle) => handle,
-            Err(e) => {
-                eprintln!("Failed to create file: {e:?}");
-                return false;
-            }
-        };
+            ptr::null_mut(),
+        );
+        if file_handle == INVALID_HANDLE_VALUE {
+            eprintln!("Failed to create file");
+            return false;
+        }
 
         let mut bytes_written = 0_u32;
-        let buffer = std::slice::from_raw_parts_mut(memory.cast::<u8>(), memory_size as usize);
-        let write_result = WriteFile(file_handle, Some(buffer), Some(&mut bytes_written), None);
-        if write_result.is_err() || bytes_written != memory_size {
+        let write_result = WriteFile(
+            file_handle,
+            memory.cast::<u8>(),
+            memory_size,
+            &mut bytes_written,
+            ptr::null_mut(),
+        );
+        if write_result == FALSE || bytes_written != memory_size {
             eprintln!("Failed to write file: {write_result:?}");
         }
 
@@ -1469,7 +1447,7 @@ pub extern "C" fn debug_platform_read_entire_file(
 ) -> DebugPlatformReadFileResult {
     unsafe {
         use interface::safe_truncate_i64_to_u32;
-        use windows::Win32::{
+        use windows_sys::Win32::{
             Foundation::{CloseHandle, GENERIC_READ, GetLastError},
             Storage::FileSystem::{
                 CreateFileA, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, GetFileSizeEx, OPEN_EXISTING,
@@ -1477,20 +1455,19 @@ pub extern "C" fn debug_platform_read_entire_file(
             },
         };
 
-        let filename = PCSTR::from_raw(filename.cast::<u8>());
+        let filename = PCSTR::from(filename.cast::<u8>());
         let file_handle = CreateFileA(
             filename,
-            GENERIC_READ.0,
+            GENERIC_READ,
             FILE_SHARE_READ,
-            None,
+            ptr::null(),
             OPEN_EXISTING,
             FILE_ATTRIBUTE_NORMAL,
-            None,
-        )
-        .expect("Failed to open file");
+            0 as HANDLE,
+        ); // TODO(aalhendi): fallible
 
         let mut file_size = 0_i64;
-        GetFileSizeEx(file_handle, &mut file_size).expect("Failed to get file size");
+        GetFileSizeEx(file_handle, &mut file_size); // TODO(aalhendi): fallible
         let file_size_u32 = safe_truncate_i64_to_u32(file_size);
 
         if file_size == 0 {
@@ -1502,18 +1479,26 @@ pub extern "C" fn debug_platform_read_entire_file(
             };
         }
 
-        let mut memory_ptr = VirtualAlloc(None, file_size as usize, MEM_COMMIT, PAGE_READWRITE);
+        let mut memory_ptr =
+            VirtualAlloc(ptr::null(), file_size as usize, MEM_COMMIT, PAGE_READWRITE);
 
         if memory_ptr.is_null() {
-            let err = windows::core::Error::from(GetLastError().to_hresult()).to_string();
-            panic!("Failed to allocate memory for file: {err}");
+            panic!(
+                "Failed to allocate memory for file. Error Code: {}",
+                GetLastError()
+            );
         }
 
-        let buffer = std::slice::from_raw_parts_mut(memory_ptr as *mut u8, file_size_u32 as usize);
-
         let mut bytes_read = 0_u32;
-        let read_result = ReadFile(file_handle, Some(buffer), Some(&mut bytes_read), None);
-        if read_result.is_err() || bytes_read != file_size_u32 {
+        let read_result = ReadFile(
+            file_handle,
+            memory_ptr.cast::<u8>(),
+            file_size_u32,
+            &mut bytes_read,
+            ptr::null_mut(),
+        );
+        // TODO(aalhendi): check result
+        if read_result == FALSE || bytes_read != file_size_u32 {
             debug_platform_free_file_memory(memory_ptr);
             eprintln!("Failed to read file: {read_result:?}");
             // sound because we just freed the memory
@@ -1528,6 +1513,195 @@ pub extern "C" fn debug_platform_read_entire_file(
         DebugPlatformReadFileResult {
             memory: memory_ptr,
             size: file_size_u32,
+        }
+    }
+}
+
+// NOTE(aalhendi): `windows-sys` in Rust does NOT support COM interfaces like DirectSound.
+// The alternative `windows` crate does support COM interfaces, but it's fat.
+#[allow(non_snake_case)]
+pub mod dsound {
+    use core::ffi::c_void;
+    use windows_sys::Win32::Foundation::HWND;
+    use windows_sys::Win32::Media::Audio::WAVEFORMATEX;
+    use windows_sys::core::GUID;
+
+    #[repr(C)]
+    pub struct DSBUFFERDESC {
+        pub dwSize: u32,
+        pub dwFlags: u32,
+        pub dwBufferBytes: u32,
+        pub dwReserved: u32,
+        pub lpwfxFormat: *mut WAVEFORMATEX,
+        pub guid3DAlgorithm: GUID,
+    }
+
+    pub const DSSCL_PRIORITY: u32 = 2u32;
+
+    pub const DSBCAPS_PRIMARYBUFFER: u32 = 1u32;
+
+    pub const DSBCAPS_GETCURRENTPOSITION2: u32 = 65536u32;
+
+    pub const DSBCAPS_GLOBALFOCUS: u32 = 32768u32;
+
+    pub const DSBCAPS_CTRL3D: u32 = 16u32;
+
+    pub const DSBPLAY_LOOPING: u32 = 1u32;
+
+    pub type HRESULT = i32;
+    pub type LPDIRECTSOUND = *mut IDirectSound;
+    pub type LPDIRECTSOUNDBUFFER = *mut IDirectSoundBuffer;
+
+    pub type DirectSoundCreateFn = unsafe extern "system" fn(
+        pcGuidDevice: *const GUID,
+        ppDS: *mut LPDIRECTSOUND,
+        pUnkOuter: *mut c_void,
+    ) -> HRESULT;
+
+    // Helper to check HRESULT
+    #[inline(always)]
+    pub fn SUCCEEDED(hr: HRESULT) -> bool {
+        hr >= 0
+    }
+
+    #[repr(C)]
+    pub struct IDirectSound {
+        pub lpVtbl: *const IDirectSoundVtbl,
+    }
+
+    #[repr(C)]
+    pub struct IDirectSoundVtbl {
+        pub QueryInterface: usize,
+        pub AddRef: usize,
+        pub Release: unsafe extern "system" fn(this: LPDIRECTSOUND) -> u32,
+        pub CreateSoundBuffer: unsafe extern "system" fn(
+            this: LPDIRECTSOUND,
+            pcDSBufferDesc: *const DSBUFFERDESC,
+            ppDSBuffer: *mut LPDIRECTSOUNDBUFFER,
+            pUnkOuter: *mut c_void,
+        ) -> HRESULT,
+        pub GetCaps: usize,
+        pub DuplicateSoundBuffer: usize,
+        pub SetCooperativeLevel:
+            unsafe extern "system" fn(this: LPDIRECTSOUND, hwnd: HWND, dwLevel: u32) -> HRESULT,
+    }
+
+    // Ergonomic wrappers so we don't have to write pointer math in our main loop
+    impl IDirectSound {
+        #[inline]
+        pub unsafe fn SetCooperativeLevel(&mut self, hwnd: HWND, level: u32) -> HRESULT {
+            unsafe { ((*self.lpVtbl).SetCooperativeLevel)(self, hwnd, level) }
+        }
+
+        #[inline]
+        pub unsafe fn CreateSoundBuffer(
+            &mut self,
+            desc: *const DSBUFFERDESC,
+            buffer: *mut LPDIRECTSOUNDBUFFER,
+        ) -> HRESULT {
+            unsafe { ((*self.lpVtbl).CreateSoundBuffer)(self, desc, buffer, core::ptr::null_mut()) }
+        }
+    }
+
+    #[repr(C)]
+    pub struct IDirectSoundBuffer {
+        pub lpVtbl: *const IDirectSoundBufferVtbl,
+    }
+
+    #[repr(C)]
+    pub struct IDirectSoundBufferVtbl {
+        pub QueryInterface: usize,
+        pub AddRef: usize,
+        pub Release: unsafe extern "system" fn(this: LPDIRECTSOUNDBUFFER) -> u32,
+        pub GetCaps: usize,
+        pub GetCurrentPosition: unsafe extern "system" fn(
+            this: LPDIRECTSOUNDBUFFER,
+            pdwCurrentPlayCursor: *mut u32,
+            pdwCurrentWriteCursor: *mut u32,
+        ) -> HRESULT,
+        pub GetFormat: usize,
+        pub GetVolume: usize,
+        pub GetPan: usize,
+        pub GetFrequency: usize,
+        pub GetStatus: usize,
+        pub Initialize: usize,
+        pub Lock: unsafe extern "system" fn(
+            this: LPDIRECTSOUNDBUFFER,
+            dwOffset: u32,
+            dwBytes: u32,
+            ppvAudioPtr1: *mut *mut c_void,
+            pdwAudioBytes1: *mut u32,
+            ppvAudioPtr2: *mut *mut c_void,
+            pdwAudioBytes2: *mut u32,
+            dwFlags: u32,
+        ) -> HRESULT,
+        pub Play: unsafe extern "system" fn(
+            this: LPDIRECTSOUNDBUFFER,
+            dwReserved1: u32,
+            dwPriority: u32,
+            dwFlags: u32,
+        ) -> HRESULT,
+        pub SetCurrentPosition: usize,
+        pub SetFormat: unsafe extern "system" fn(
+            this: LPDIRECTSOUNDBUFFER,
+            pcfxFormat: *const WAVEFORMATEX,
+        ) -> HRESULT,
+        pub SetVolume: usize,
+        pub SetPan: usize,
+        pub SetFrequency: usize,
+        pub Stop: usize,
+        pub Unlock: unsafe extern "system" fn(
+            this: LPDIRECTSOUNDBUFFER,
+            pvAudioPtr1: *const c_void,
+            dwAudioBytes1: u32,
+            pvAudioPtr2: *const c_void,
+            dwAudioBytes2: u32,
+        ) -> HRESULT,
+    }
+
+    impl IDirectSoundBuffer {
+        #[inline]
+        pub unsafe fn SetFormat(&mut self, format: *const WAVEFORMATEX) -> HRESULT {
+            unsafe { ((*self.lpVtbl).SetFormat)(self, format) }
+        }
+
+        #[inline]
+        pub unsafe fn Play(&mut self, reserved1: u32, priority: u32, flags: u32) -> HRESULT {
+            unsafe { ((*self.lpVtbl).Play)(self, reserved1, priority, flags) }
+        }
+
+        #[inline]
+        pub unsafe fn GetCurrentPosition(
+            &mut self,
+            play_cursor: *mut u32,
+            write_cursor: *mut u32,
+        ) -> HRESULT {
+            unsafe { ((*self.lpVtbl).GetCurrentPosition)(self, play_cursor, write_cursor) }
+        }
+
+        #[inline]
+        pub unsafe fn Lock(
+            &mut self,
+            offset: u32,
+            bytes: u32,
+            ptr1: *mut *mut c_void,
+            bytes1: *mut u32,
+            ptr2: *mut *mut c_void,
+            bytes2: *mut u32,
+            flags: u32,
+        ) -> HRESULT {
+            unsafe { ((*self.lpVtbl).Lock)(self, offset, bytes, ptr1, bytes1, ptr2, bytes2, flags) }
+        }
+
+        #[inline]
+        pub unsafe fn Unlock(
+            &mut self,
+            ptr1: *const c_void,
+            bytes1: u32,
+            ptr2: *const c_void,
+            bytes2: u32,
+        ) -> HRESULT {
+            unsafe { ((*self.lpVtbl).Unlock)(self, ptr1, bytes1, ptr2, bytes2) }
         }
     }
 }
