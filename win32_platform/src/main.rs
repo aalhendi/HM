@@ -12,8 +12,8 @@ use interface::DebugPlatformReadFileResult;
 use windows_sys::{
     Win32::{
         Foundation::{
-            ERROR_SUCCESS, FALSE, FreeLibrary, HANDLE, HINSTANCE, HMODULE, HWND,
-            INVALID_HANDLE_VALUE, LPARAM, LRESULT, RECT, WPARAM,
+            ERROR_SUCCESS, FALSE, FILETIME, FreeLibrary, HANDLE, HINSTANCE, HMODULE, HWND,
+            INVALID_HANDLE_VALUE, LPARAM, LRESULT, MAX_PATH, RECT, WPARAM,
         },
         Graphics::Gdi::{
             BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BeginPaint, DIB_RGB_COLORS, EndPaint, GetDC, HDC,
@@ -23,9 +23,11 @@ use windows_sys::{
             Audio::{WAVE_FORMAT_PCM, WAVEFORMATEX},
             TIMERR_NOERROR, timeBeginPeriod,
         },
-        Storage::FileSystem::CopyFileA,
+        Storage::FileSystem::{
+            CompareFileTime, CopyFileA, FindClose, FindFirstFileA, WIN32_FIND_DATAA,
+        },
         System::{
-            LibraryLoader::{GetModuleHandleA, GetProcAddress, LoadLibraryA},
+            LibraryLoader::{GetModuleFileNameA, GetModuleHandleA, GetProcAddress, LoadLibraryA},
             Memory::{
                 MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
             },
@@ -124,6 +126,8 @@ unsafe extern "C" fn game_get_sound_samples_stub(
 struct Win32GameCode {
     // Windows DLL handle (we'll need this to unload it later)
     pub game_code_dll: HMODULE,
+    // The last time the DLL was modified
+    pub last_write_time: FILETIME,
 
     // The function pointers
     pub update_and_render: GameUpdateAndRenderFn,
@@ -132,9 +136,23 @@ struct Win32GameCode {
     pub is_valid: bool,
 }
 
-fn win32_load_game_code(dll_file_path: PCSTR) -> Win32GameCode {
+#[inline]
+fn win32_get_last_write_time(file_name: PCSTR) -> FILETIME {
+    let mut last_write_time = FILETIME::default();
+    let mut find_data = WIN32_FIND_DATAA::default();
+    let find_handle = unsafe { FindFirstFileA(file_name, &mut find_data) };
+    if find_handle != INVALID_HANDLE_VALUE {
+        last_write_time = find_data.ftLastWriteTime;
+        unsafe { FindClose(find_handle) };
+    }
+
+    last_write_time
+}
+
+fn win32_load_game_code(source_dll_name: PCSTR, temp_dll_name: PCSTR) -> Win32GameCode {
     let mut game_code = Win32GameCode {
         game_code_dll: HMODULE::default(),
+        last_write_time: FILETIME::default(),
         update_and_render: game_update_and_render_stub,
         get_sound_samples: game_get_sound_samples_stub,
         is_valid: false,
@@ -143,11 +161,11 @@ fn win32_load_game_code(dll_file_path: PCSTR) -> Win32GameCode {
     unsafe {
         // NOTE(aalhendi): we are using a temp file here because we want to load the DLL into memory,
         // without locking the file which Windows will do if we try to load it directly.
-        // TODO(aalhendi): proper path here (cargo run fails because of /target directory)
-        // TODO(aalhendi): determine when updates are necessary automatically. (hash?)
         // TODO(aalhendi): fallible
-        CopyFileA(dll_file_path, s!("game_temp.dll"), FALSE);
-        let game_code_dll_handle = LoadLibraryA(s!("game_temp.dll"));
+
+        game_code.last_write_time = win32_get_last_write_time(source_dll_name);
+        CopyFileA(source_dll_name, temp_dll_name, FALSE);
+        let game_code_dll_handle = LoadLibraryA(temp_dll_name);
 
         if !game_code_dll_handle.is_null() {
             game_code.game_code_dll = game_code_dll_handle;
@@ -819,21 +837,54 @@ fn main() {
         let mut audio_latency_sec;
         let mut is_sound_valid = false;
 
-        let mut game = win32_load_game_code(s!("hm.dll"));
-        let mut load_counter = 0;
+        // NOTE(aalhendi): Never use MAX_PATH in code that is user-facing because it can be dangerous and lead to bad resutls.
+        const MAX_PATH_USIZE: usize = MAX_PATH as usize;
+        let mut exe_file_path = [0u8; MAX_PATH_USIZE];
+        GetModuleFileNameA(
+            module_handle,
+            exe_file_path.as_mut_ptr(),
+            exe_file_path.len() as u32,
+        );
+
+        let mut one_past_last_slash = 0usize;
+        for (i, c) in exe_file_path.iter().enumerate() {
+            if *c == 0 {
+                break;
+            }
+            if *c == b'\\' {
+                one_past_last_slash = i.checked_add(1).expect("Overflow in one_past_last_slash");
+            }
+        }
+
+        let mut source_dll_name_buf = [0u8; MAX_PATH_USIZE];
+        let hm = b"hm.dll";
+        source_dll_name_buf[..one_past_last_slash]
+            .copy_from_slice(&exe_file_path[..one_past_last_slash]);
+        source_dll_name_buf[one_past_last_slash..one_past_last_slash + hm.len()]
+            .copy_from_slice(hm);
+        let source_dll_name = source_dll_name_buf.as_ptr();
+
+        let mut temp_dll_name_buf = [0u8; MAX_PATH_USIZE];
+        let tmp = b"game_temp.dll";
+        temp_dll_name_buf[..one_past_last_slash]
+            .copy_from_slice(&exe_file_path[..one_past_last_slash]);
+        temp_dll_name_buf[one_past_last_slash..one_past_last_slash + tmp.len()]
+            .copy_from_slice(tmp);
+        let temp_dll_name = temp_dll_name_buf.as_ptr();
+
+        let mut game = win32_load_game_code(source_dll_name, temp_dll_name);
 
         // TODO(aalhendi): do we want to use rdtscp instead?
         let mut last_cycle_count = x86_64::_rdtsc();
 
         while GLOBAL_RUNNING {
-            if load_counter > 120 {
+            let new_dll_write_time = win32_get_last_write_time(source_dll_name);
+            if CompareFileTime(&new_dll_write_time, &game.last_write_time) != 0 {
                 win32_unload_game_code(&mut game);
-                game = win32_load_game_code(s!("hm.dll"));
-
-                load_counter = 0;
-            } else {
-                load_counter += 1;
+                game = win32_load_game_code(source_dll_name, temp_dll_name);
+                game.last_write_time = new_dll_write_time;
             }
+
             let new_keyboard_controller = &mut new_input.controllers[0];
             let old_keyboard_controller = &mut old_input.controllers[0];
             // TODO(aalhendi): we can't zero everything because the up/down count will be wrong
