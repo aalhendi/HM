@@ -12,19 +12,22 @@ use interface::DebugPlatformReadFileResult;
 use windows_sys::{
     Win32::{
         Foundation::{
-            ERROR_SUCCESS, FALSE, FILETIME, FreeLibrary, HANDLE, HINSTANCE, HMODULE, HWND,
-            INVALID_HANDLE_VALUE, LPARAM, LRESULT, MAX_PATH, RECT, WPARAM,
+            COLORREF, CloseHandle, ERROR_SUCCESS, FALSE, FILETIME, FreeLibrary, GENERIC_READ,
+            GENERIC_WRITE, HANDLE, HINSTANCE, HMODULE, HWND, INVALID_HANDLE_VALUE, LPARAM, LRESULT,
+            MAX_PATH, RECT, TRUE, WPARAM,
         },
         Graphics::Gdi::{
             BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BeginPaint, DIB_RGB_COLORS, EndPaint, GetDC, HDC,
-            PAINTSTRUCT, SRCCOPY, StretchDIBits,
+            PAINTSTRUCT, ReleaseDC, SRCCOPY, StretchDIBits,
         },
         Media::{
             Audio::{WAVE_FORMAT_PCM, WAVEFORMATEX},
             TIMERR_NOERROR, timeBeginPeriod,
         },
         Storage::FileSystem::{
-            CompareFileTime, CopyFileA, FindClose, FindFirstFileA, WIN32_FIND_DATAA,
+            CREATE_ALWAYS, CompareFileTime, CopyFileA, CreateFileA, FILE_ATTRIBUTE_NORMAL,
+            FILE_SHARE_NONE, FILE_SHARE_READ, FindClose, FindFirstFileA, OPEN_EXISTING, ReadFile,
+            WIN32_FIND_DATAA, WriteFile,
         },
         System::{
             LibraryLoader::{GetModuleFileNameA, GetModuleHandleA, GetProcAddress, LoadLibraryA},
@@ -36,8 +39,8 @@ use windows_sys::{
         UI::{
             Input::{
                 KeyboardAndMouse::{
-                    VIRTUAL_KEY, VK_A, VK_D, VK_DOWN, VK_E, VK_ESCAPE, VK_F4, VK_LEFT, VK_Q,
-                    VK_RIGHT, VK_S, VK_SPACE, VK_UP, VK_W,
+                    VIRTUAL_KEY, VK_A, VK_D, VK_DOWN, VK_E, VK_ESCAPE, VK_F4, VK_L, VK_LEFT, VK_P,
+                    VK_Q, VK_RIGHT, VK_S, VK_SPACE, VK_UP, VK_W,
                 },
                 XboxController::{
                     XINPUT_GAMEPAD_A, XINPUT_GAMEPAD_B, XINPUT_GAMEPAD_BACK,
@@ -123,6 +126,12 @@ unsafe extern "C" fn game_get_sound_samples_stub(
     // Do nothing.
 }
 
+/// A helper function to create a COLORREF from RGB values. `windows-sys` doesn't have the equivalent of the C macro `RGB`.
+#[inline(always)]
+const fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
+    (r as u32) | ((g as u32) << 8) | ((b as u32) << 16)
+}
+
 struct Win32GameCode {
     // Windows DLL handle (we'll need this to unload it later)
     pub game_code_dll: HMODULE,
@@ -134,6 +143,18 @@ struct Win32GameCode {
     pub get_sound_samples: GameGetSoundSamplesFn,
 
     pub is_valid: bool,
+}
+
+#[derive(Default)]
+struct Win32State {
+    total_size: usize,
+    game_memory_block: *mut (),
+
+    recording_file_handle: HANDLE,
+    input_playing_idx: u32,
+
+    input_recording_idx: u32,
+    playback_file_handle: HANDLE,
 }
 
 #[inline]
@@ -244,7 +265,10 @@ fn win32_init_dsound(
 
         let direct_sound_create: DirectSoundCreateFn =
             match GetProcAddress(dsound_lib, s!("DirectSoundCreate")) {
-                Some(ds_create_proc) => mem::transmute(ds_create_proc),
+                Some(ds_create_proc) => mem::transmute::<
+                    unsafe extern "system" fn() -> isize,
+                    DirectSoundCreateFn,
+                >(ds_create_proc),
                 None => return Err("Failed to get DirectSoundCreate address"),
             };
 
@@ -504,7 +528,7 @@ struct Win32OffscreenBuffer {
     // NOTE(aalhendi): We store width and height in self.info.bmiHeader. This is redundant. Keeping because its only 8 bytes
     width: i32,
     height: i32,
-    pitch: isize,
+    pitch: i32,
     bytes_per_pixel: i32,
 }
 
@@ -571,7 +595,7 @@ impl Win32OffscreenBuffer {
             )
         };
 
-        self.pitch = (width * self.bytes_per_pixel) as isize;
+        self.pitch = width * self.bytes_per_pixel;
         // TODO(aalhendi): Probably clear this to black
     }
 
@@ -664,13 +688,144 @@ impl Win32OffscreenBuffer {
             self.memory
                 .cast::<u8>()
                 .add((x * self.bytes_per_pixel) as usize)
-                .offset(top as isize * self.pitch)
+                .offset((top * self.pitch) as isize)
         };
         for _y in top..bottom {
             unsafe {
                 *(pixel as *mut u32) = color;
                 pixel = pixel.add(self.pitch as usize);
             };
+        }
+    }
+}
+
+fn win32_begin_recording_input(state: &mut Win32State, input_recording_idx: u32) {
+    state.input_recording_idx = input_recording_idx;
+    // TODO(aalhendi): These files must fo in a temp/build directory!
+    // TODO(aalhendi): lazily write giant memory block and use a memory copy instead?
+
+    let filename = PCSTR::from(c"foo.hmi".as_ptr().cast::<u8>());
+    state.recording_file_handle = unsafe {
+        CreateFileA(
+            filename,
+            GENERIC_WRITE,
+            FILE_SHARE_NONE,
+            ptr::null(),
+            CREATE_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL,
+            ptr::null_mut(),
+        )
+    };
+    if state.recording_file_handle == INVALID_HANDLE_VALUE {
+        panic!("Failed to create recording file");
+    }
+
+    let bytes_to_write = state.total_size as u32;
+    debug_assert_eq!(state.total_size, bytes_to_write as usize);
+    let mut bytes_written = 0_u32;
+    let write_result = unsafe {
+        WriteFile(
+            state.recording_file_handle,
+            state.game_memory_block.cast::<u8>(),
+            bytes_to_write,
+            &mut bytes_written,
+            ptr::null_mut(),
+        )
+    };
+    if write_result == FALSE || bytes_written != bytes_to_write {
+        eprintln!("Failed to write recording file: {write_result:?}");
+    }
+}
+
+fn win32_end_recording_input(state: &mut Win32State) {
+    unsafe {
+        CloseHandle(state.recording_file_handle);
+    }
+    state.input_recording_idx = 0;
+}
+
+fn win32_begin_input_playback(state: &mut Win32State, input_playing_idx: u32) {
+    state.input_playing_idx = input_playing_idx;
+
+    let filename = PCSTR::from(c"foo.hmi".as_ptr().cast::<u8>());
+    state.playback_file_handle = unsafe {
+        CreateFileA(
+            filename,
+            GENERIC_READ,
+            FILE_SHARE_READ,
+            ptr::null(),
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            0 as HANDLE,
+        )
+    };
+
+    let bytes_to_read = state.total_size as u32;
+    debug_assert_eq!(state.total_size, bytes_to_read as usize);
+    let mut bytes_read = 0_u32;
+    let read_result = unsafe {
+        ReadFile(
+            state.playback_file_handle,
+            state.game_memory_block.cast::<u8>(),
+            bytes_to_read,
+            &mut bytes_read,
+            ptr::null_mut(),
+        )
+    };
+    if read_result == FALSE || bytes_read != bytes_to_read {
+        eprintln!("Failed to read recording file: {read_result:?}");
+    }
+}
+
+fn win32_end_input_playback(state: &mut Win32State) {
+    unsafe {
+        CloseHandle(state.playback_file_handle);
+    }
+    state.input_playing_idx = 0;
+}
+
+fn win32_record_input(state: &mut Win32State, new_input: &mut GameInput) {
+    let memory_size = size_of::<GameInput>() as u32;
+    let mut bytes_written = 0_u32;
+    let write_result = unsafe {
+        WriteFile(
+            state.recording_file_handle,
+            (new_input as *mut GameInput).cast::<u8>(),
+            memory_size,
+            &mut bytes_written,
+            ptr::null_mut(),
+        )
+    };
+    if write_result == FALSE || bytes_written != memory_size {
+        eprintln!("Failed to write into recording file: {write_result:?}");
+    }
+}
+
+fn win32_playback_input(state: &mut Win32State, new_input: &mut GameInput) {
+    let mut bytes_read = 0_u32;
+    let file_size = size_of::<GameInput>() as u32;
+    let read_result = unsafe {
+        ReadFile(
+            state.playback_file_handle,
+            (new_input as *mut GameInput).cast::<u8>(),
+            file_size,
+            &mut bytes_read,
+            ptr::null_mut(),
+        )
+    };
+    if read_result == TRUE && bytes_read == 0 {
+        // NOTE(aalhendi): we've hit the end of the stream, go back to the beginning
+        let playing_idx = state.input_playing_idx;
+        win32_end_input_playback(state);
+        win32_begin_input_playback(state, playing_idx);
+        unsafe {
+            ReadFile(
+                state.playback_file_handle,
+                (new_input as *mut GameInput).cast::<u8>(),
+                file_size,
+                &mut bytes_read,
+                ptr::null_mut(),
+            );
         }
     }
 }
@@ -696,7 +851,7 @@ fn main() {
         let instance = HINSTANCE::from(GetModuleHandleA(ptr::null()));
 
         let wc = WNDCLASSA {
-            style: CS_HREDRAW | CS_VREDRAW | CS_OWNDC,
+            style: CS_HREDRAW | CS_VREDRAW,
             lpfnWndProc: Some(win32_main_window_callback),
             hInstance: instance,
             lpszClassName: s!("HandmadeHeroWindowClass"),
@@ -713,7 +868,7 @@ fn main() {
 
         // TODO(aalhendi): fallible
         let window_handle = CreateWindowExA(
-            WINDOW_EX_STYLE::default(), // 0
+            WS_EX_TOPMOST | WS_EX_LAYERED,
             wc.lpszClassName,
             s!("Handmade Hero"),
             WS_OVERLAPPEDWINDOW | WS_VISIBLE,
@@ -726,9 +881,6 @@ fn main() {
             HINSTANCE::from(module_handle),
             ptr::null(),
         );
-
-        // NOTE(aalhendi): By using CS_OWNDC, can get one device context and keep using it forever since it is not shared.
-        let device_context = GetDC(window_handle);
 
         // NOTE(aalhendi): Audio test
         // TODO(aalhendi): make this sixty seconds?
@@ -747,6 +899,7 @@ fn main() {
         win32_clear_sound_buffer(secondary_buffer, &mut sound_output);
         (*secondary_buffer).Play(0, 0, dsound::DSBPLAY_LOOPING); // TODO(aalhendi): fallible
 
+        let mut state = Win32State::default();
         GLOBAL_RUNNING = true;
 
         /*
@@ -785,12 +938,14 @@ fn main() {
             }
         };
 
-        let permanent_storage = VirtualAlloc(
+        state.total_size = total_storage_size;
+        state.game_memory_block = VirtualAlloc(
             base_address as *mut ffi::c_void,
-            total_storage_size,
+            state.total_size,
             MEM_RESERVE | MEM_COMMIT,
             PAGE_READWRITE,
         ) as *mut ();
+        let permanent_storage = state.game_memory_block;
 
         let mut game_memory = GameMemory {
             is_initialized: false,
@@ -894,7 +1049,7 @@ fn main() {
                 button.ended_down = old_keyboard_controller.buttons[i].ended_down;
             }
 
-            win32_process_pending_messages(new_keyboard_controller);
+            win32_process_pending_messages(&mut state, new_keyboard_controller);
 
             if !GLOBAL_PAUSE {
                 // TODO(aalhendi): should we poll this more frequently?
@@ -1059,8 +1214,15 @@ fn main() {
                     width: GLOBAL_BACKBUFFER.width,
                     height: GLOBAL_BACKBUFFER.height,
                     pitch: GLOBAL_BACKBUFFER.pitch,
+                    bytes_per_pixel: GLOBAL_BACKBUFFER.bytes_per_pixel,
                     memory: GLOBAL_BACKBUFFER.memory,
                 };
+                if state.input_recording_idx == 1 {
+                    win32_record_input(&mut state, new_input);
+                }
+                if state.input_playing_idx == 1 {
+                    win32_playback_input(&mut state, new_input);
+                }
                 (game.update_and_render)(&mut game_memory, new_input, &mut buffer);
 
                 /*
@@ -1241,11 +1403,13 @@ fn main() {
                     TARGET_SECONDS_PER_FRAME,
                 );
 
+                let device_context = GetDC(window_handle);
                 GLOBAL_BACKBUFFER.win32_copy_buffer_to_window(
                     device_context,
                     dims.width,
                     dims.height,
                 );
+                ReleaseDC(window_handle, device_context);
 
                 flip_wall_clock = win32_get_wall_clock();
 
@@ -1288,7 +1452,10 @@ fn main() {
     }
 }
 
-unsafe fn win32_process_pending_messages(keyboard_controller: &mut GameControllerInput) {
+unsafe fn win32_process_pending_messages(
+    state: &mut Win32State,
+    keyboard_controller: &mut GameControllerInput,
+) {
     let mut message = MSG::default();
     while unsafe { PeekMessageA(&mut message, ptr::null_mut(), 0, 0, PM_REMOVE) != FALSE } {
         match message.message {
@@ -1367,6 +1534,19 @@ unsafe fn win32_process_pending_messages(keyboard_controller: &mut GameControlle
                                 }
                             }
                         }
+                        VK_L => {
+                            #[cfg(feature = "internal_build")]
+                            {
+                                if is_down {
+                                    if state.input_recording_idx == 0 {
+                                        win32_begin_recording_input(state, 1);
+                                    } else {
+                                        win32_end_recording_input(state);
+                                        win32_begin_input_playback(state, 1);
+                                    }
+                                }
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -1408,6 +1588,8 @@ extern "system" fn win32_main_window_callback(
 
             WM_ACTIVATEAPP => {
                 println!("WM_ACTIVATE");
+                let b_alpha = if wparam == TRUE as usize { 255 } else { 64 };
+                SetLayeredWindowAttributes(window, rgb(0, 0, 0), b_alpha, LWA_ALPHA);
                 LRESULT::from(0_isize)
             }
             WM_PAINT => {
@@ -1639,11 +1821,15 @@ pub mod dsound {
 
     // Ergonomic wrappers so we don't have to write pointer math in our main loop
     impl IDirectSound {
+        /// # Safety
+        /// unsafe. windows
         #[inline]
         pub unsafe fn SetCooperativeLevel(&mut self, hwnd: HWND, level: u32) -> HRESULT {
             unsafe { ((*self.lpVtbl).SetCooperativeLevel)(self, hwnd, level) }
         }
 
+        /// # Safety
+        /// unsafe. windows
         #[inline]
         pub unsafe fn CreateSoundBuffer(
             &mut self,
@@ -1711,16 +1897,22 @@ pub mod dsound {
     }
 
     impl IDirectSoundBuffer {
+        /// # Safety
+        /// unsafe. windows
         #[inline]
         pub unsafe fn SetFormat(&mut self, format: *const WAVEFORMATEX) -> HRESULT {
             unsafe { ((*self.lpVtbl).SetFormat)(self, format) }
         }
 
+        /// # Safety
+        /// unsafe. windows
         #[inline]
         pub unsafe fn Play(&mut self, reserved1: u32, priority: u32, flags: u32) -> HRESULT {
             unsafe { ((*self.lpVtbl).Play)(self, reserved1, priority, flags) }
         }
 
+        /// # Safety
+        /// unsafe. windows
         #[inline]
         pub unsafe fn GetCurrentPosition(
             &mut self,
@@ -1730,6 +1922,9 @@ pub mod dsound {
             unsafe { ((*self.lpVtbl).GetCurrentPosition)(self, play_cursor, write_cursor) }
         }
 
+        /// # Safety
+        /// unsafe. windows
+        #[allow(clippy::too_many_arguments)]
         #[inline]
         pub unsafe fn Lock(
             &mut self,
@@ -1744,6 +1939,8 @@ pub mod dsound {
             unsafe { ((*self.lpVtbl).Lock)(self, offset, bytes, ptr1, bytes1, ptr2, bytes2, flags) }
         }
 
+        /// # Safety
+        /// unsafe. windows
         #[inline]
         pub unsafe fn Unlock(
             &mut self,

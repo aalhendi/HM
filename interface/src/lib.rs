@@ -9,7 +9,8 @@ pub struct GameOffscreenBuffer {
     // NOTE(aalhendi): We store width and height in self.info.bmiHeader. This is redundant. Keeping because its only 8 bytes
     pub width: i32,
     pub height: i32,
-    pub pitch: isize,
+    pub pitch: i32,
+    pub bytes_per_pixel: i32,
 }
 
 #[repr(C)]

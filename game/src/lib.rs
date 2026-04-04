@@ -15,6 +15,10 @@ pub struct GameState {
     pub green_offset: i32,
 
     pub t_sine: f32,
+
+    pub player_x: i32,
+    pub player_y: i32,
+    pub t_jump: f32,
 }
 
 fn game_output_sound(game_state: &mut GameState, buffer: &mut GameSoundOutputBuffer, tone_hz: u32) {
@@ -24,8 +28,13 @@ fn game_output_sound(game_state: &mut GameState, buffer: &mut GameSoundOutputBuf
     unsafe {
         let mut sample_out = buffer.samples;
         for _sample_index in 0..buffer.sample_count {
-            let sine_value = f32::sin(game_state.t_sine);
-            let sample_value = (sine_value * tone_volume as f32) as i16;
+            let sample_value = if false {
+                let sine_value = f32::sin(game_state.t_sine);
+                let sample_value = (sine_value * tone_volume as f32) as i16;
+                sample_value
+            } else {
+                0
+            };
 
             // basically, we write L/R L/R L/R L/R etc.
             // we use sample_out as an i16 ptr to the memory location we want to write to (region1 / ringbuffer)
@@ -79,6 +88,9 @@ pub extern "C" fn game_update_and_render(
         game_state.tone_hz = 512;
         game_state.t_sine = 0_f32;
 
+        game_state.player_x = 100;
+        game_state.player_y = 100;
+
         // NOTE(aalhendi): these are not needed because they are cleared to 0 at startup by requirement!
         // game_state.blue_offset = 0;
         // game_state.green_offset = 0;
@@ -105,9 +117,21 @@ pub extern "C" fn game_update_and_render(
         if controller.button(GameButton::ActionDown).ended_down {
             game_state.green_offset += 1;
         }
+        game_state.player_x += (4.0_f32 * controller.left_stick_average_x) as i32;
+        game_state.player_y -= (4.0_f32 * controller.left_stick_average_y) as i32;
+
+        if game_state.t_jump > 0.0 {
+            game_state.player_y +=
+                (5_f32 * f32::sin(0.5 * f32::consts::PI * game_state.t_jump)) as i32
+        }
+        if controller.button(GameButton::ActionDown).ended_down {
+            game_state.t_jump = 4.0;
+        }
+        game_state.t_jump -= 0.033;
     }
 
     render_weird_gradient(buffer, game_state.blue_offset, game_state.green_offset);
+    render_player(buffer, game_state.player_x, game_state.player_y);
 }
 
 // NOTE(aalhendi): At the moment, this has to be a very fast function, it cannot be more than a millisecond
@@ -143,6 +167,36 @@ fn render_weird_gradient(buffer: &mut GameOffscreenBuffer, blue_offset: i32, gre
                 pixel = pixel.offset(1);
             }
         }
-        row = unsafe { row.offset(buffer.pitch) };
+        row = unsafe { row.offset(buffer.pitch as isize) };
+    }
+}
+
+fn render_player(buffer: &mut GameOffscreenBuffer, player_x: i32, player_y: i32) {
+    let end_of_buffer = unsafe {
+        buffer
+            .memory
+            .cast::<u8>()
+            .add((buffer.pitch * buffer.height) as usize)
+    };
+    let color = 0xFFFFFFFF;
+    let top = player_y;
+    let bottom = player_y + 10;
+
+    for x in player_x..player_x + 10 {
+        let mut pixel = unsafe {
+            buffer
+                .memory
+                .cast::<u8>()
+                .add((x * buffer.bytes_per_pixel) as usize)
+                .offset((top * buffer.pitch) as isize)
+        };
+        for _y in top..bottom {
+            unsafe {
+                if pixel >= buffer.memory.cast::<u8>() && pixel < end_of_buffer {
+                    *(pixel as *mut u32) = color;
+                    pixel = pixel.add(buffer.pitch as usize);
+                }
+            };
+        }
     }
 }
