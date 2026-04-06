@@ -12,9 +12,9 @@ use interface::DebugPlatformReadFileResult;
 use windows_sys::{
     Win32::{
         Foundation::{
-            COLORREF, CloseHandle, ERROR_SUCCESS, FALSE, FILETIME, FreeLibrary, GENERIC_READ,
-            GENERIC_WRITE, HANDLE, HINSTANCE, HMODULE, HWND, INVALID_HANDLE_VALUE, LPARAM, LRESULT,
-            MAX_PATH, RECT, TRUE, WPARAM,
+            COLORREF, CloseHandle, ERROR_SUCCESS, FALSE, FARPROC, FILETIME, FreeLibrary,
+            GENERIC_READ, GENERIC_WRITE, HANDLE, HINSTANCE, HMODULE, HWND, INVALID_HANDLE_VALUE,
+            LPARAM, LRESULT, MAX_PATH, RECT, TRUE, WPARAM,
         },
         Graphics::Gdi::{
             BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BeginPaint, DIB_RGB_COLORS, EndPaint, GetDC, HDC,
@@ -26,13 +26,14 @@ use windows_sys::{
         },
         Storage::FileSystem::{
             CREATE_ALWAYS, CompareFileTime, CopyFileA, CreateFileA, FILE_ATTRIBUTE_NORMAL,
-            FILE_SHARE_NONE, FILE_SHARE_READ, FindClose, FindFirstFileA, OPEN_EXISTING, ReadFile,
-            WIN32_FIND_DATAA, WriteFile,
+            FILE_SHARE_NONE, FILE_SHARE_READ, GetFileAttributesExA, GetFileExInfoStandard,
+            OPEN_EXISTING, ReadFile, WIN32_FILE_ATTRIBUTE_DATA, WriteFile,
         },
         System::{
             LibraryLoader::{GetModuleFileNameA, GetModuleHandleA, GetProcAddress, LoadLibraryA},
             Memory::{
-                MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+                MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE,
+                VirtualAlloc, VirtualFree,
             },
             Performance::{QueryPerformanceCounter, QueryPerformanceFrequency},
         },
@@ -76,6 +77,8 @@ use windows_sys::{
 
 */
 
+// NOTE(aalhendi): Never use MAX_PATH in code that is user-facing because it can be dangerous and lead to bad resutls.
+const MAX_PATH_USIZE: usize = MAX_PATH as usize;
 const KEY_MESSAGE_WAS_DOWN_BIT: i32 = 30;
 const KEY_MESSAGE_IS_DOWN_BIT: i32 = 31;
 const KEY_MESSAGE_IS_ALT_BIT: i32 = 29;
@@ -108,28 +111,19 @@ pub type GameUpdateAndRenderFn = unsafe extern "C" fn(
 pub type GameGetSoundSamplesFn =
     unsafe extern "C" fn(memory: &mut GameMemory, sound_buffer: &mut GameSoundOutputBuffer);
 
-// NOTE(aalhendi): if the DLL fails to load, the function pointers still point to valid memory.
-// This prevents the game from crashing if DLL is momentarily missing.
-// we COULD use Option<T> to handle missing data, but we don't want an `if` branch running 60x/sec
-unsafe extern "C" fn game_update_and_render_stub(
-    _memory: &mut GameMemory,
-    _input: &mut GameInput,
-    _buffer: &mut GameOffscreenBuffer,
-) {
-    // Do nothing.
-}
-
-unsafe extern "C" fn game_get_sound_samples_stub(
-    _memory: &mut GameMemory,
-    _sound_buffer: &mut GameSoundOutputBuffer,
-) {
-    // Do nothing.
-}
-
 /// A helper function to create a COLORREF from RGB values. `windows-sys` doesn't have the equivalent of the C macro `RGB`.
 #[inline(always)]
 const fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
     (r as u32) | ((g as u32) << 8) | ((b as u32) << 16)
+}
+
+#[repr(transparent)]
+struct Win32Path([u8; MAX_PATH_USIZE]);
+
+impl Win32Path {
+    fn as_ptr(&self) -> *const u8 {
+        self.0.as_ptr()
+    }
 }
 
 struct Win32GameCode {
@@ -139,13 +133,12 @@ struct Win32GameCode {
     pub last_write_time: FILETIME,
 
     // The function pointers
-    pub update_and_render: GameUpdateAndRenderFn,
-    pub get_sound_samples: GameGetSoundSamplesFn,
+    pub update_and_render: Option<GameUpdateAndRenderFn>,
+    pub get_sound_samples: Option<GameGetSoundSamplesFn>,
 
     pub is_valid: bool,
 }
 
-#[derive(Default)]
 struct Win32State {
     total_size: usize,
     game_memory_block: *mut (),
@@ -155,27 +148,82 @@ struct Win32State {
 
     input_recording_idx: u32,
     playback_file_handle: HANDLE,
+
+    pub exe_file_name: [u8; MAX_PATH_USIZE],
+    pub exe_file_name_base_offset: usize,
+}
+
+impl Default for Win32State {
+    fn default() -> Self {
+        Self {
+            total_size: 0,
+            game_memory_block: ptr::null_mut(),
+            recording_file_handle: INVALID_HANDLE_VALUE,
+            input_playing_idx: 0,
+            input_recording_idx: 0,
+            playback_file_handle: INVALID_HANDLE_VALUE,
+            exe_file_name: [0; MAX_PATH as usize],
+            exe_file_name_base_offset: 0,
+        }
+    }
+}
+
+impl Win32State {
+    fn win32_get_exe_file_name(&mut self, module_handle: HMODULE) {
+        let buffer_ptr = self.exe_file_name.as_mut_ptr();
+        let buffer_len = self.exe_file_name.len() as u32;
+        let file_name_size = unsafe { GetModuleFileNameA(module_handle, buffer_ptr, buffer_len) };
+
+        // NOTE(aalhendi): check for failure or partial path. They are both useless.
+        if file_name_size == 0 || file_name_size >= buffer_len {
+            eprintln!("Error: GetModuleFileNameA failed");
+            self.exe_file_name_base_offset = 0;
+            return;
+        }
+
+        if let Some(pos) = self.exe_file_name[..file_name_size as usize]
+            .iter()
+            .rposition(|&c| c == b'\\' || c == b'/')
+        {
+            self.exe_file_name_base_offset = pos + 1;
+        } else {
+            self.exe_file_name_base_offset = 0;
+        }
+    }
+
+    fn win32_build_exe_path_file_name(&self, file_name: &ffi::CStr, dest: &mut Win32Path) {
+        let base_len = self.exe_file_name_base_offset;
+        let file_bytes = file_name.to_bytes_with_nul();
+
+        debug_assert!(
+            base_len + file_bytes.len() <= dest.0.len(),
+            "Path buffer too small!"
+        );
+
+        dest.0[..base_len].copy_from_slice(&self.exe_file_name[..base_len]);
+
+        let end_idx = base_len + file_bytes.len();
+        dest.0[base_len..end_idx].copy_from_slice(file_bytes);
+    }
 }
 
 #[inline]
 fn win32_get_last_write_time(file_name: PCSTR) -> FILETIME {
-    let mut last_write_time = FILETIME::default();
-    let mut find_data = WIN32_FIND_DATAA::default();
-    let find_handle = unsafe { FindFirstFileA(file_name, &mut find_data) };
-    if find_handle != INVALID_HANDLE_VALUE {
-        last_write_time = find_data.ftLastWriteTime;
-        unsafe { FindClose(find_handle) };
+    let mut data = WIN32_FILE_ATTRIBUTE_DATA::default();
+    let data_ptr = &mut data as *mut WIN32_FILE_ATTRIBUTE_DATA as *mut ffi::c_void;
+    let result = unsafe { GetFileAttributesExA(file_name, GetFileExInfoStandard, data_ptr) };
+    if result == FALSE {
+        panic!("GetFileAttributesExA failed");
     }
-
-    last_write_time
+    data.ftLastWriteTime
 }
 
 fn win32_load_game_code(source_dll_name: PCSTR, temp_dll_name: PCSTR) -> Win32GameCode {
     let mut game_code = Win32GameCode {
         game_code_dll: HMODULE::default(),
         last_write_time: FILETIME::default(),
-        update_and_render: game_update_and_render_stub,
-        get_sound_samples: game_get_sound_samples_stub,
+        update_and_render: None,
+        get_sound_samples: None,
         is_valid: false,
     };
 
@@ -194,20 +242,11 @@ fn win32_load_game_code(source_dll_name: PCSTR, temp_dll_name: PCSTR) -> Win32Ga
             let update_proc = GetProcAddress(game_code_dll_handle, s!("game_update_and_render"));
             let sound_proc = GetProcAddress(game_code_dll_handle, s!("game_get_sound_samples"));
 
-            if let (Some(update_ptr), Some(sound_ptr)) = (update_proc, sound_proc) {
-                game_code.update_and_render = mem::transmute::<
-                    unsafe extern "system" fn() -> isize,
-                    GameUpdateAndRenderFn,
-                >(update_ptr);
-                game_code.get_sound_samples = mem::transmute::<
-                    unsafe extern "system" fn() -> isize,
-                    GameGetSoundSamplesFn,
-                >(sound_ptr);
-                game_code.is_valid = true;
-            } else {
-                // NOTE(aalhendi): we are already safely pointing to stubs!
-                println!("Error: Found the DLL, but couldn't find the functions inside it.");
-            }
+            game_code.update_and_render =
+                mem::transmute::<FARPROC, Option<GameUpdateAndRenderFn>>(update_proc);
+            game_code.get_sound_samples =
+                mem::transmute::<FARPROC, Option<GameGetSoundSamplesFn>>(sound_proc);
+            game_code.is_valid = true;
         }
     }
 
@@ -221,8 +260,8 @@ fn win32_unload_game_code(game_code: &mut Win32GameCode) {
             FreeLibrary(game_code.game_code_dll);
         }
         game_code.is_valid = false;
-        game_code.get_sound_samples = game_get_sound_samples_stub;
-        game_code.update_and_render = game_update_and_render_stub;
+        game_code.get_sound_samples = None;
+        game_code.update_and_render = None;
     }
 }
 
@@ -533,16 +572,16 @@ struct Win32OffscreenBuffer {
 }
 
 impl Win32OffscreenBuffer {
-    unsafe fn win32_copy_buffer_to_window(&self, device_context: HDC, width: i32, height: i32) {
-        // TODO(aalhendi): aspect ratio correction
-        // TODO(aalhendi): play with stretch modes
+    unsafe fn win32_copy_buffer_to_window(&self, device_context: HDC, _width: i32, _height: i32) {
+        // NOTE(aalhendi): for prototyping purposes, we're going to always blit 1-1 pixels to make sure we don't introduce artifacts
+        //  with stretching until we get a decent renderer
         unsafe {
             StretchDIBits(
                 device_context,
                 0,
                 0,
-                width,
-                height,
+                self.width,
+                self.height,
                 0,
                 0,
                 self.width,
@@ -834,9 +873,17 @@ fn main() {
     unsafe {
         // TODO(aalhendi): fallible
         let module_handle = GetModuleHandleA(ptr::null());
+        let mut state = Win32State::default();
 
         // TODO(aalhendi): fallible
         QueryPerformanceFrequency(&mut PERF_COUNT_FREQUENCY);
+
+        state.win32_get_exe_file_name(module_handle);
+
+        let mut source_dll_name = Win32Path([0; MAX_PATH_USIZE]);
+        let mut temp_dll_name = Win32Path([0; MAX_PATH_USIZE]);
+        state.win32_build_exe_path_file_name(c"hm.dll", &mut source_dll_name);
+        state.win32_build_exe_path_file_name(c"game_temp.dll", &mut temp_dll_name);
 
         // NOTE(aalhendi): Set windows scheduler granularity. This is used to make our sleep more accurate (granular).
         let desired_scheduler_ms = 1;
@@ -899,7 +946,6 @@ fn main() {
         win32_clear_sound_buffer(secondary_buffer, &mut sound_output);
         (*secondary_buffer).Play(0, 0, dsound::DSBPLAY_LOOPING); // TODO(aalhendi): fallible
 
-        let mut state = Win32State::default();
         GLOBAL_RUNNING = true;
 
         /*
@@ -923,7 +969,7 @@ fn main() {
         ) as *mut i16;
 
         let permanent_storage_size = megabytes_to_bytes(64);
-        let transient_storage_size = gigabytes_to_bytes(4);
+        let transient_storage_size = gigabytes_to_bytes(1);
         // TODO(aalhendi): handle various memory footprints (USING SYSTEM METRICS)
         let total_storage_size = permanent_storage_size + transient_storage_size;
         let base_address = {
@@ -939,6 +985,7 @@ fn main() {
         };
 
         state.total_size = total_storage_size;
+        // TODO(aalhendi): look into using MEM_LARGE_PAGES?
         state.game_memory_block = VirtualAlloc(
             base_address as *mut ffi::c_void,
             state.total_size,
@@ -992,51 +1039,16 @@ fn main() {
         let mut audio_latency_sec;
         let mut is_sound_valid = false;
 
-        // NOTE(aalhendi): Never use MAX_PATH in code that is user-facing because it can be dangerous and lead to bad resutls.
-        const MAX_PATH_USIZE: usize = MAX_PATH as usize;
-        let mut exe_file_path = [0u8; MAX_PATH_USIZE];
-        GetModuleFileNameA(
-            module_handle,
-            exe_file_path.as_mut_ptr(),
-            exe_file_path.len() as u32,
-        );
-
-        let mut one_past_last_slash = 0usize;
-        for (i, c) in exe_file_path.iter().enumerate() {
-            if *c == 0 {
-                break;
-            }
-            if *c == b'\\' {
-                one_past_last_slash = i.checked_add(1).expect("Overflow in one_past_last_slash");
-            }
-        }
-
-        let mut source_dll_name_buf = [0u8; MAX_PATH_USIZE];
-        let hm = b"hm.dll";
-        source_dll_name_buf[..one_past_last_slash]
-            .copy_from_slice(&exe_file_path[..one_past_last_slash]);
-        source_dll_name_buf[one_past_last_slash..one_past_last_slash + hm.len()]
-            .copy_from_slice(hm);
-        let source_dll_name = source_dll_name_buf.as_ptr();
-
-        let mut temp_dll_name_buf = [0u8; MAX_PATH_USIZE];
-        let tmp = b"game_temp.dll";
-        temp_dll_name_buf[..one_past_last_slash]
-            .copy_from_slice(&exe_file_path[..one_past_last_slash]);
-        temp_dll_name_buf[one_past_last_slash..one_past_last_slash + tmp.len()]
-            .copy_from_slice(tmp);
-        let temp_dll_name = temp_dll_name_buf.as_ptr();
-
-        let mut game = win32_load_game_code(source_dll_name, temp_dll_name);
+        let mut game = win32_load_game_code(source_dll_name.as_ptr(), temp_dll_name.as_ptr());
 
         // TODO(aalhendi): do we want to use rdtscp instead?
         let mut last_cycle_count = x86_64::_rdtsc();
 
         while GLOBAL_RUNNING {
-            let new_dll_write_time = win32_get_last_write_time(source_dll_name);
+            let new_dll_write_time = win32_get_last_write_time(source_dll_name.as_ptr());
             if CompareFileTime(&new_dll_write_time, &game.last_write_time) != 0 {
                 win32_unload_game_code(&mut game);
-                game = win32_load_game_code(source_dll_name, temp_dll_name);
+                game = win32_load_game_code(source_dll_name.as_ptr(), temp_dll_name.as_ptr());
                 game.last_write_time = new_dll_write_time;
             }
 
@@ -1054,19 +1066,21 @@ fn main() {
             if !GLOBAL_PAUSE {
                 // TODO(aalhendi): should we poll this more frequently?
                 // TODO(aalhendi): need to not poll disconnected controllers to avoid xinput frame hit on older libraries
-                let mut max_controller_count = XUSER_MAX_COUNT;
-                if max_controller_count as usize > new_input.controllers.len() {
-                    max_controller_count = new_input.controllers.len() as u32;
+                let mut max_controller_count = XUSER_MAX_COUNT as usize;
+                if max_controller_count > new_input.controllers.len() {
+                    max_controller_count = new_input.controllers.len();
                 }
                 // NOTE(aalhendi): max controller count minus the keyboard controller
                 for controller_index in 0..max_controller_count - 1 {
-                    let old_controller = &mut old_input.controllers[controller_index as usize];
-                    let new_controller = &mut new_input.controllers[controller_index as usize];
+                    let old_controller = &mut old_input.controllers[controller_index];
+                    let new_controller = &mut new_input.controllers[controller_index];
 
                     let mut controller_state: XINPUT_STATE = XINPUT_STATE::default();
-                    let x_input_state_res = XInputGetState(controller_index, &mut controller_state);
+                    let x_input_state_res =
+                        XInputGetState(controller_index as u32, &mut controller_state);
                     if x_input_state_res == ERROR_SUCCESS {
                         new_controller.is_connected = true;
+                        new_controller.is_analog = old_controller.is_analog;
 
                         // NOTE(aalhendi): This controller is connected
                         // TODO(aalhendi): see if controller_state.dwPacketNumber increments too rapidly
@@ -1223,7 +1237,10 @@ fn main() {
                 if state.input_playing_idx == 1 {
                     win32_playback_input(&mut state, new_input);
                 }
-                (game.update_and_render)(&mut game_memory, new_input, &mut buffer);
+
+                if let Some(update_and_render) = game.update_and_render {
+                    update_and_render(&mut game_memory, new_input, &mut buffer);
+                }
 
                 /*
                 NOTE(aalhendi): Here is how sound output computation works.
@@ -1330,7 +1347,10 @@ fn main() {
                         sample_count: bytes_to_write / sound_output.bytes_per_sample,
                         samples,
                     };
-                    (game.get_sound_samples)(&mut game_memory, &mut sound_buffer);
+
+                    if let Some(get_sound_samples) = game.get_sound_samples {
+                        get_sound_samples(&mut game_memory, &mut sound_buffer);
+                    }
 
                     // NOTE(aalhendi): ideally, we want to only fill sound buffer if there's something to write.
                     // this fn calls Lock(), which can fail if bytes_to_write is 0,
@@ -1468,9 +1488,6 @@ unsafe fn win32_process_pending_messages(
                 let is_down = (message.lParam & (1 << KEY_MESSAGE_IS_DOWN_BIT)) == 0;
                 let is_alt_down = (message.lParam & (1 << KEY_MESSAGE_IS_ALT_BIT)) != 0;
                 if was_down != is_down {
-                    #[allow(unreachable_patterns)]
-                    #[allow(unused_variables)]
-                    #[allow(non_snake_case)]
                     match VIRTUAL_KEY::from(virtual_key_code as u16) {
                         VK_W => win32_process_keyboard_message(
                             keyboard_controller.button_mut(GameButton::MoveUp),

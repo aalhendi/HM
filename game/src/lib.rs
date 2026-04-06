@@ -28,13 +28,8 @@ fn game_output_sound(game_state: &mut GameState, buffer: &mut GameSoundOutputBuf
     unsafe {
         let mut sample_out = buffer.samples;
         for _sample_index in 0..buffer.sample_count {
-            let sample_value = if false {
-                let sine_value = f32::sin(game_state.t_sine);
-                let sample_value = (sine_value * tone_volume as f32) as i16;
-                sample_value
-            } else {
-                0
-            };
+            let sine_value = f32::sin(game_state.t_sine);
+            let sample_value = (sine_value * tone_volume as f32) as i16;
 
             // basically, we write L/R L/R L/R L/R etc.
             // we use sample_out as an i16 ptr to the memory location we want to write to (region1 / ringbuffer)
