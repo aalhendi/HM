@@ -2,10 +2,12 @@
 
 // NOTE(aalhendi): Services that the game provides to the platform layer
 
-use core::{f32, mem};
+use core::f32;
 #[cfg(feature = "internal_build")]
 use core::{ffi, slice};
-use interface::{GameButton, GameInput, GameMemory, GameOffscreenBuffer, GameSoundOutputBuffer};
+use interface::{
+    GameButton, GameInput, GameMemory, GameOffscreenBuffer, GameSoundOutputBuffer, ThreadContext,
+};
 
 #[derive(Default)]
 #[repr(C)]
@@ -21,7 +23,12 @@ pub struct GameState {
     pub t_jump: f32,
 }
 
-fn game_output_sound(game_state: &mut GameState, buffer: &mut GameSoundOutputBuffer, tone_hz: u32) {
+fn game_output_sound(
+    _thread: &mut ThreadContext,
+    game_state: &mut GameState,
+    buffer: &mut GameSoundOutputBuffer,
+    tone_hz: u32,
+) {
     let tone_volume = 3000;
     let wave_period = buffer.samples_per_second / tone_hz;
 
@@ -48,12 +55,13 @@ fn game_output_sound(game_state: &mut GameState, buffer: &mut GameSoundOutputBuf
 
 #[unsafe(no_mangle)]
 pub extern "C" fn game_update_and_render(
+    thread: &mut ThreadContext,
     memory: &mut GameMemory,
     input: &mut GameInput,
     buffer: &mut GameOffscreenBuffer,
 ) {
     debug_assert!(
-        mem::size_of::<GameState>() <= memory.permanent_storage_size,
+        size_of::<GameState>() <= memory.permanent_storage_size,
         "GameState is too large for permanent storage"
     );
 
@@ -63,7 +71,7 @@ pub extern "C" fn game_update_and_render(
         #[cfg(feature = "internal_build")]
         {
             let filename = c"game/src/lib.rs".as_ptr();
-            let read_result = unsafe { (memory.debug_platform_read_entire_file)(filename) };
+            let read_result = unsafe { (memory.debug_platform_read_entire_file)(thread, filename) };
 
             let file_memory = unsafe {
                 slice::from_raw_parts_mut(read_result.memory as *mut u8, read_result.size as usize)
@@ -71,12 +79,13 @@ pub extern "C" fn game_update_and_render(
 
             unsafe {
                 (memory.debug_platform_write_entire_file)(
+                    thread,
                     c"test.out".as_ptr(),
                     file_memory.len() as u32,
                     file_memory.as_mut_ptr().cast::<ffi::c_void>(),
                 );
 
-                (memory.debug_platform_free_file_memory)(read_result.memory);
+                (memory.debug_platform_free_file_memory)(thread, read_result.memory);
             }
         }
 
@@ -127,6 +136,13 @@ pub extern "C" fn game_update_and_render(
 
     render_weird_gradient(buffer, game_state.blue_offset, game_state.green_offset);
     render_player(buffer, game_state.player_x, game_state.player_y);
+
+    render_player(buffer, input.mouse_x, input.mouse_y);
+    for (button_idx, button) in input.mouse_buttons.iter().enumerate() {
+        if button.ended_down {
+            render_player(buffer, 10 + 20 * button_idx as i32, 10);
+        }
+    }
 }
 
 // NOTE(aalhendi): At the moment, this has to be a very fast function, it cannot be more than a millisecond
@@ -134,11 +150,12 @@ pub extern "C" fn game_update_and_render(
 // TODO(aalhendi): reduce the pressure on this function's performance by measuring it or asking about it.
 #[unsafe(no_mangle)]
 pub extern "C" fn game_get_sound_samples(
+    thread: &mut ThreadContext,
     memory: &mut GameMemory,
     sound_buffer: &mut GameSoundOutputBuffer,
 ) {
     let game_state = unsafe { &mut *memory.permanent_storage.cast::<GameState>() };
-    game_output_sound(game_state, sound_buffer, game_state.tone_hz);
+    game_output_sound(thread, game_state, sound_buffer, game_state.tone_hz);
 }
 
 fn render_weird_gradient(buffer: &mut GameOffscreenBuffer, blue_offset: i32, green_offset: i32) {

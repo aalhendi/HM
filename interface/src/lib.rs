@@ -43,6 +43,7 @@ impl Default for GameMemory {
     fn default() -> Self {
         #[cfg(feature = "internal_build")]
         unsafe extern "C" fn default_read_file(
+            _thread_context: &mut ThreadContext,
             _filename: *const core::ffi::c_char,
         ) -> DebugPlatformReadFileResult {
             unimplemented!("default_read_file is not implemented for this platform")
@@ -50,6 +51,7 @@ impl Default for GameMemory {
 
         #[cfg(feature = "internal_build")]
         unsafe extern "C" fn default_write_file(
+            _thread_context: &mut ThreadContext,
             _filename: *const core::ffi::c_char,
             _memory_size: u32,
             _memory: *mut core::ffi::c_void,
@@ -58,7 +60,10 @@ impl Default for GameMemory {
         }
 
         #[cfg(feature = "internal_build")]
-        unsafe extern "C" fn default_free_memory(_memory: *mut core::ffi::c_void) {
+        unsafe extern "C" fn default_free_memory(
+            _thread_context: &mut ThreadContext,
+            _memory: *mut core::ffi::c_void,
+        ) {
             unimplemented!("default_free_memory is not implemented for this platform")
         }
 
@@ -87,18 +92,22 @@ pub struct DebugPlatformReadFileResult {
 }
 
 #[cfg(feature = "internal_build")]
-pub type DebugPlatformReadEntireFileFn =
-    unsafe extern "C" fn(filename: *const core::ffi::c_char) -> DebugPlatformReadFileResult;
+pub type DebugPlatformReadEntireFileFn = unsafe extern "C" fn(
+    thread_context: &mut ThreadContext,
+    filename: *const core::ffi::c_char,
+) -> DebugPlatformReadFileResult;
 
 #[cfg(feature = "internal_build")]
 pub type DebugPlatformWriteEntireFileFn = unsafe extern "C" fn(
+    thread_context: &mut ThreadContext,
     filename: *const core::ffi::c_char,
     memory_size: u32,
     memory: *mut core::ffi::c_void,
 ) -> bool;
 
 #[cfg(feature = "internal_build")]
-pub type DebugPlatformFreeFileMemoryFn = unsafe extern "C" fn(memory: *mut core::ffi::c_void);
+pub type DebugPlatformFreeFileMemoryFn =
+    unsafe extern "C" fn(thread_context: &mut ThreadContext, memory: *mut core::ffi::c_void);
 
 #[repr(C)]
 pub enum GameButton {
@@ -158,6 +167,11 @@ impl GameControllerInput {
 #[derive(Default)]
 #[repr(C)]
 pub struct GameInput {
+    pub mouse_buttons: [GameButtonState; 5],
+    pub mouse_x: i32,
+    pub mouse_y: i32,
+    pub mouse_z: i32,
+
     // TODO(aalhendi): insert clock values here.
     pub controllers: [GameControllerInput; 5], // 4 controllers + 1 keyboard
 }
@@ -186,4 +200,10 @@ pub const fn terabytes_to_bytes(terabytes: usize) -> usize {
 pub fn safe_truncate_i64_to_u32(value: i64) -> u32 {
     debug_assert!(value < u32::MAX as i64, "Value is too large");
     value as u32
+}
+
+#[derive(Default)]
+#[repr(C)]
+pub struct ThreadContext {
+    placeholder: u32,
 }

@@ -3,7 +3,7 @@
 use core::{arch::x86_64, ffi, mem, ptr};
 use interface::{
     GameButton, GameButtonState, GameControllerInput, GameInput, GameMemory, GameOffscreenBuffer,
-    GameSoundOutputBuffer, gigabytes_to_bytes, megabytes_to_bytes,
+    GameSoundOutputBuffer, ThreadContext, gigabytes_to_bytes, megabytes_to_bytes,
 };
 
 #[cfg(feature = "internal_build")]
@@ -12,13 +12,14 @@ use interface::DebugPlatformReadFileResult;
 use windows_sys::{
     Win32::{
         Foundation::{
-            COLORREF, CloseHandle, ERROR_SUCCESS, FALSE, FARPROC, FILETIME, FreeLibrary,
-            GENERIC_READ, GENERIC_WRITE, HANDLE, HINSTANCE, HMODULE, HWND, INVALID_HANDLE_VALUE,
-            LPARAM, LRESULT, MAX_PATH, RECT, TRUE, WPARAM,
+            CloseHandle, ERROR_SUCCESS, FALSE, FARPROC, FILETIME, FreeLibrary, GENERIC_READ,
+            GENERIC_WRITE, HANDLE, HINSTANCE, HMODULE, HWND, INVALID_HANDLE_VALUE, LPARAM, LRESULT,
+            MAX_PATH, POINT, RECT, TRUE, WPARAM,
         },
         Graphics::Gdi::{
-            BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BeginPaint, DIB_RGB_COLORS, EndPaint, GetDC, HDC,
-            PAINTSTRUCT, ReleaseDC, SRCCOPY, StretchDIBits,
+            BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BeginPaint, DIB_RGB_COLORS, EndPaint, GetDC,
+            GetDeviceCaps, HDC, PAINTSTRUCT, ReleaseDC, SRCCOPY, ScreenToClient, StretchDIBits,
+            VREFRESH,
         },
         Media::{
             Audio::{WAVE_FORMAT_PCM, WAVEFORMATEX},
@@ -32,16 +33,17 @@ use windows_sys::{
         System::{
             LibraryLoader::{GetModuleFileNameA, GetModuleHandleA, GetProcAddress, LoadLibraryA},
             Memory::{
-                MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE,
-                VirtualAlloc, VirtualFree,
+                CreateFileMappingA, FILE_MAP_ALL_ACCESS, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE,
+                MapViewOfFile, PAGE_READWRITE, VirtualAlloc, VirtualFree,
             },
             Performance::{QueryPerformanceCounter, QueryPerformanceFrequency},
         },
         UI::{
             Input::{
                 KeyboardAndMouse::{
-                    VIRTUAL_KEY, VK_A, VK_D, VK_DOWN, VK_E, VK_ESCAPE, VK_F4, VK_L, VK_LEFT, VK_P,
-                    VK_Q, VK_RIGHT, VK_S, VK_SPACE, VK_UP, VK_W,
+                    GetKeyState, VIRTUAL_KEY, VK_A, VK_D, VK_DOWN, VK_E, VK_ESCAPE, VK_F4, VK_L,
+                    VK_LBUTTON, VK_LEFT, VK_MBUTTON, VK_P, VK_Q, VK_RBUTTON, VK_RIGHT, VK_S,
+                    VK_SPACE, VK_UP, VK_W, VK_XBUTTON1, VK_XBUTTON2,
                 },
                 XboxController::{
                     XINPUT_GAMEPAD_A, XINPUT_GAMEPAD_B, XINPUT_GAMEPAD_BACK,
@@ -83,11 +85,6 @@ const KEY_MESSAGE_WAS_DOWN_BIT: i32 = 30;
 const KEY_MESSAGE_IS_DOWN_BIT: i32 = 31;
 const KEY_MESSAGE_IS_ALT_BIT: i32 = 29;
 
-// TODO(aalhendi): GetSystemMetrics(SM_SAMPLERATE)? How do we reliably query refresh rate? GetComposition?
-const MONITOR_REFRESH_HZ: i32 = 60;
-const GAME_UPDATE_HZ: i32 = MONITOR_REFRESH_HZ / 2;
-const TARGET_SECONDS_PER_FRAME: f64 = 1_f64 / GAME_UPDATE_HZ as f64;
-
 // TODO(aalhendi): This is a global for now.
 static mut GLOBAL_RUNNING: bool = false;
 static mut GLOBAL_PAUSE: bool = false;
@@ -103,28 +100,23 @@ static mut GLOBAL_BACKBUFFER: Win32OffscreenBuffer = Win32OffscreenBuffer {
 static mut PERF_COUNT_FREQUENCY: i64 = 0;
 
 pub type GameUpdateAndRenderFn = unsafe extern "C" fn(
+    thread: &mut ThreadContext,
     memory: &mut GameMemory,
     input: &mut GameInput,
     buffer: &mut GameOffscreenBuffer,
 );
 
-pub type GameGetSoundSamplesFn =
-    unsafe extern "C" fn(memory: &mut GameMemory, sound_buffer: &mut GameSoundOutputBuffer);
+pub type GameGetSoundSamplesFn = unsafe extern "C" fn(
+    thread: &mut ThreadContext,
+    memory: &mut GameMemory,
+    sound_buffer: &mut GameSoundOutputBuffer,
+);
 
-/// A helper function to create a COLORREF from RGB values. `windows-sys` doesn't have the equivalent of the C macro `RGB`.
-#[inline(always)]
-const fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
-    (r as u32) | ((g as u32) << 8) | ((b as u32) << 16)
-}
-
-#[repr(transparent)]
-struct Win32Path([u8; MAX_PATH_USIZE]);
-
-impl Win32Path {
-    fn as_ptr(&self) -> *const u8 {
-        self.0.as_ptr()
-    }
-}
+// /// A helper function to create a COLORREF from RGB values. `windows-sys` doesn't have the equivalent of the C macro `RGB`.
+// #[inline(always)]
+// const fn rgb(r: u8, g: u8, b: u8) -> windows_sys::Win32::Foundation::COLORREF {
+//     (r as u32) | ((g as u32) << 8) | ((b as u32) << 16)
+// }
 
 struct Win32GameCode {
     // Windows DLL handle (we'll need this to unload it later)
@@ -142,6 +134,7 @@ struct Win32GameCode {
 struct Win32State {
     total_size: usize,
     game_memory_block: *mut (),
+    replay_buffers: [Win32ReplayBuffer; 4],
 
     recording_file_handle: HANDLE,
     input_playing_idx: u32,
@@ -158,17 +151,32 @@ impl Default for Win32State {
         Self {
             total_size: 0,
             game_memory_block: ptr::null_mut(),
+            replay_buffers: [Win32ReplayBuffer {
+                file_handle: INVALID_HANDLE_VALUE,
+                memory_map: INVALID_HANDLE_VALUE,
+                file_name: [0; MAX_PATH_USIZE],
+                memory_block: ptr::null_mut(),
+            }; 4],
             recording_file_handle: INVALID_HANDLE_VALUE,
             input_playing_idx: 0,
             input_recording_idx: 0,
             playback_file_handle: INVALID_HANDLE_VALUE,
-            exe_file_name: [0; MAX_PATH as usize],
+            exe_file_name: [0; MAX_PATH_USIZE],
             exe_file_name_base_offset: 0,
         }
     }
 }
 
 impl Win32State {
+    fn win32_get_input_file_location(&self, input_stream: bool, slot_index: u32, dest: &mut [u8]) {
+        let type_str = if input_stream { "input" } else { "state" };
+        // NOTE: We manually append the null terminator '\0' so CStr doesn't panic
+        let file_str = format!("loop_edit_{}_{}.hmi\0", slot_index, type_str);
+        let c_str = ffi::CStr::from_bytes_with_nul(file_str.as_bytes())
+            .expect("Failed to create CStr from file name");
+        self.win32_build_exe_path_file_name(c_str, dest);
+    }
+
     fn win32_get_exe_file_name(&mut self, module_handle: HMODULE) {
         let buffer_ptr = self.exe_file_name.as_mut_ptr();
         let buffer_len = self.exe_file_name.len() as u32;
@@ -191,20 +199,163 @@ impl Win32State {
         }
     }
 
-    fn win32_build_exe_path_file_name(&self, file_name: &ffi::CStr, dest: &mut Win32Path) {
+    fn win32_build_exe_path_file_name(&self, file_name: &ffi::CStr, dest: &mut [u8]) {
         let base_len = self.exe_file_name_base_offset;
         let file_bytes = file_name.to_bytes_with_nul();
 
         debug_assert!(
-            base_len + file_bytes.len() <= dest.0.len(),
+            base_len + file_bytes.len() <= dest.len(),
             "Path buffer too small!"
         );
 
-        dest.0[..base_len].copy_from_slice(&self.exe_file_name[..base_len]);
+        dest[..base_len].copy_from_slice(&self.exe_file_name[..base_len]);
 
         let end_idx = base_len + file_bytes.len();
-        dest.0[base_len..end_idx].copy_from_slice(file_bytes);
+        dest[base_len..end_idx].copy_from_slice(file_bytes);
     }
+
+    fn win32_begin_recording_input(&mut self, input_recording_idx: u32) {
+        // TODO(aalhendi): These files must fo in a temp/build directory!
+        debug_assert!(input_recording_idx < self.replay_buffers.len() as u32);
+        let replay_buffer = self.replay_buffers[input_recording_idx as usize];
+
+        if replay_buffer.memory_block.is_null() {
+            println!("No replay buffer found!");
+            return;
+        }
+
+        self.input_recording_idx = input_recording_idx;
+
+        let mut file_name = [0_u8; MAX_PATH_USIZE];
+        self.win32_get_input_file_location(true, input_recording_idx, &mut file_name);
+
+        self.recording_file_handle = unsafe {
+            CreateFileA(
+                file_name.as_ptr(),
+                GENERIC_WRITE,
+                FILE_SHARE_NONE,
+                ptr::null(),
+                CREATE_ALWAYS,
+                FILE_ATTRIBUTE_NORMAL,
+                ptr::null_mut(),
+            )
+        };
+        if self.recording_file_handle == INVALID_HANDLE_VALUE {
+            panic!("Failed to create recording file");
+        }
+
+        // NOTE(aalhendi): take memory snapshot (Copy from Game -> Replay Buffer)
+        unsafe {
+            ptr::copy_nonoverlapping(
+                self.game_memory_block.cast::<u8>(),
+                replay_buffer.memory_block.cast::<u8>(),
+                self.total_size,
+            );
+        }
+    }
+
+    fn win32_end_recording_input(&mut self) {
+        unsafe {
+            CloseHandle(self.recording_file_handle);
+        }
+        self.input_recording_idx = 0;
+    }
+
+    fn win32_begin_input_playback(&mut self, input_playing_idx: u32) {
+        debug_assert!(input_playing_idx < self.replay_buffers.len() as u32);
+        let replay_buffer = &mut self.replay_buffers[input_playing_idx as usize];
+        if replay_buffer.memory_block.is_null() {
+            println!("No replay buffer found!");
+            return;
+        }
+
+        self.input_playing_idx = input_playing_idx;
+
+        // NOTE(aalhendi): restore the memory snapshot (Copy from Replay Buffer -> Game)
+        unsafe {
+            ptr::copy_nonoverlapping(
+                replay_buffer.memory_block.cast::<u8>(),
+                self.game_memory_block.cast::<u8>(),
+                self.total_size,
+            );
+        }
+
+        let mut file_name = [0_u8; MAX_PATH_USIZE];
+        self.win32_get_input_file_location(true, input_playing_idx, &mut file_name);
+
+        self.playback_file_handle = unsafe {
+            CreateFileA(
+                file_name.as_ptr(),
+                GENERIC_READ,
+                FILE_SHARE_READ,
+                ptr::null(),
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                0 as HANDLE,
+            )
+        };
+    }
+
+    fn win32_end_input_playback(&mut self) {
+        unsafe {
+            CloseHandle(self.playback_file_handle);
+        }
+        self.input_playing_idx = 0;
+    }
+
+    fn win32_record_input(&mut self, new_input: &mut GameInput) {
+        let memory_size = size_of::<GameInput>() as u32;
+        let mut bytes_written = 0_u32;
+        let write_result = unsafe {
+            WriteFile(
+                self.recording_file_handle,
+                (new_input as *mut GameInput).cast::<u8>(),
+                memory_size,
+                &mut bytes_written,
+                ptr::null_mut(),
+            )
+        };
+        if write_result == FALSE || bytes_written != memory_size {
+            eprintln!("Failed to write into recording file: {write_result:?}");
+        }
+    }
+
+    fn win32_playback_input(&mut self, new_input: &mut GameInput) {
+        let mut bytes_read = 0_u32;
+        let file_size = size_of::<GameInput>() as u32;
+        let read_result = unsafe {
+            ReadFile(
+                self.playback_file_handle,
+                (new_input as *mut GameInput).cast::<u8>(),
+                file_size,
+                &mut bytes_read,
+                ptr::null_mut(),
+            )
+        };
+        if read_result == TRUE && bytes_read == 0 {
+            // NOTE(aalhendi): we've hit the end of the stream, go back to the beginning
+            let playing_idx = self.input_playing_idx;
+            self.win32_end_input_playback();
+            self.win32_begin_input_playback(playing_idx);
+            unsafe {
+                ReadFile(
+                    self.playback_file_handle,
+                    (new_input as *mut GameInput).cast::<u8>(),
+                    file_size,
+                    &mut bytes_read,
+                    ptr::null_mut(),
+                );
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Win32ReplayBuffer {
+    pub file_handle: HANDLE,
+    pub memory_map: HANDLE,
+    pub file_name: [u8; MAX_PATH_USIZE],
+    pub memory_block: *mut (),
 }
 
 #[inline]
@@ -391,7 +542,7 @@ struct Win32SoundOutput {
 }
 
 impl Win32SoundOutput {
-    fn new(samples_per_second: u32) -> Self {
+    fn new(samples_per_second: u32, game_update_hz: u32) -> Self {
         let bytes_per_sample = size_of::<i16>() as u32 * 2;
 
         Self {
@@ -400,7 +551,7 @@ impl Win32SoundOutput {
             bytes_per_sample,
             buffer_size: samples_per_second * bytes_per_sample, // 2 channels, 2 bytes per sample
             // TODO(aalhendi): actually compute this variance and see lowest reasonable value
-            safety_bytes: ((samples_per_second * bytes_per_sample) / GAME_UPDATE_HZ as u32) / 3,
+            safety_bytes: ((samples_per_second * bytes_per_sample) / game_update_hz) / 3,
         }
     }
 }
@@ -504,12 +655,10 @@ fn win32_fill_sound_buffer(
 }
 
 fn win32_process_keyboard_message(new_state: &mut GameButtonState, is_down: bool) {
-    debug_assert!(
-        new_state.ended_down != is_down,
-        "Button state is already in the desired state. We should hit this if the state changed."
-    );
-    new_state.ended_down = is_down;
-    new_state.half_transition_count += 1;
+    if new_state.ended_down != is_down {
+        new_state.ended_down = is_down;
+        new_state.half_transition_count += 1;
+    }
 }
 
 fn win32_process_x_input_digital_button(
@@ -738,137 +887,6 @@ impl Win32OffscreenBuffer {
     }
 }
 
-fn win32_begin_recording_input(state: &mut Win32State, input_recording_idx: u32) {
-    state.input_recording_idx = input_recording_idx;
-    // TODO(aalhendi): These files must fo in a temp/build directory!
-    // TODO(aalhendi): lazily write giant memory block and use a memory copy instead?
-
-    let filename = PCSTR::from(c"foo.hmi".as_ptr().cast::<u8>());
-    state.recording_file_handle = unsafe {
-        CreateFileA(
-            filename,
-            GENERIC_WRITE,
-            FILE_SHARE_NONE,
-            ptr::null(),
-            CREATE_ALWAYS,
-            FILE_ATTRIBUTE_NORMAL,
-            ptr::null_mut(),
-        )
-    };
-    if state.recording_file_handle == INVALID_HANDLE_VALUE {
-        panic!("Failed to create recording file");
-    }
-
-    let bytes_to_write = state.total_size as u32;
-    debug_assert_eq!(state.total_size, bytes_to_write as usize);
-    let mut bytes_written = 0_u32;
-    let write_result = unsafe {
-        WriteFile(
-            state.recording_file_handle,
-            state.game_memory_block.cast::<u8>(),
-            bytes_to_write,
-            &mut bytes_written,
-            ptr::null_mut(),
-        )
-    };
-    if write_result == FALSE || bytes_written != bytes_to_write {
-        eprintln!("Failed to write recording file: {write_result:?}");
-    }
-}
-
-fn win32_end_recording_input(state: &mut Win32State) {
-    unsafe {
-        CloseHandle(state.recording_file_handle);
-    }
-    state.input_recording_idx = 0;
-}
-
-fn win32_begin_input_playback(state: &mut Win32State, input_playing_idx: u32) {
-    state.input_playing_idx = input_playing_idx;
-
-    let filename = PCSTR::from(c"foo.hmi".as_ptr().cast::<u8>());
-    state.playback_file_handle = unsafe {
-        CreateFileA(
-            filename,
-            GENERIC_READ,
-            FILE_SHARE_READ,
-            ptr::null(),
-            OPEN_EXISTING,
-            FILE_ATTRIBUTE_NORMAL,
-            0 as HANDLE,
-        )
-    };
-
-    let bytes_to_read = state.total_size as u32;
-    debug_assert_eq!(state.total_size, bytes_to_read as usize);
-    let mut bytes_read = 0_u32;
-    let read_result = unsafe {
-        ReadFile(
-            state.playback_file_handle,
-            state.game_memory_block.cast::<u8>(),
-            bytes_to_read,
-            &mut bytes_read,
-            ptr::null_mut(),
-        )
-    };
-    if read_result == FALSE || bytes_read != bytes_to_read {
-        eprintln!("Failed to read recording file: {read_result:?}");
-    }
-}
-
-fn win32_end_input_playback(state: &mut Win32State) {
-    unsafe {
-        CloseHandle(state.playback_file_handle);
-    }
-    state.input_playing_idx = 0;
-}
-
-fn win32_record_input(state: &mut Win32State, new_input: &mut GameInput) {
-    let memory_size = size_of::<GameInput>() as u32;
-    let mut bytes_written = 0_u32;
-    let write_result = unsafe {
-        WriteFile(
-            state.recording_file_handle,
-            (new_input as *mut GameInput).cast::<u8>(),
-            memory_size,
-            &mut bytes_written,
-            ptr::null_mut(),
-        )
-    };
-    if write_result == FALSE || bytes_written != memory_size {
-        eprintln!("Failed to write into recording file: {write_result:?}");
-    }
-}
-
-fn win32_playback_input(state: &mut Win32State, new_input: &mut GameInput) {
-    let mut bytes_read = 0_u32;
-    let file_size = size_of::<GameInput>() as u32;
-    let read_result = unsafe {
-        ReadFile(
-            state.playback_file_handle,
-            (new_input as *mut GameInput).cast::<u8>(),
-            file_size,
-            &mut bytes_read,
-            ptr::null_mut(),
-        )
-    };
-    if read_result == TRUE && bytes_read == 0 {
-        // NOTE(aalhendi): we've hit the end of the stream, go back to the beginning
-        let playing_idx = state.input_playing_idx;
-        win32_end_input_playback(state);
-        win32_begin_input_playback(state, playing_idx);
-        unsafe {
-            ReadFile(
-                state.playback_file_handle,
-                (new_input as *mut GameInput).cast::<u8>(),
-                file_size,
-                &mut bytes_read,
-                ptr::null_mut(),
-            );
-        }
-    }
-}
-
 fn main() {
     unsafe {
         // TODO(aalhendi): fallible
@@ -880,8 +898,8 @@ fn main() {
 
         state.win32_get_exe_file_name(module_handle);
 
-        let mut source_dll_name = Win32Path([0; MAX_PATH_USIZE]);
-        let mut temp_dll_name = Win32Path([0; MAX_PATH_USIZE]);
+        let mut source_dll_name = [0; MAX_PATH_USIZE];
+        let mut temp_dll_name = [0; MAX_PATH_USIZE];
         state.win32_build_exe_path_file_name(c"hm.dll", &mut source_dll_name);
         state.win32_build_exe_path_file_name(c"game_temp.dll", &mut temp_dll_name);
 
@@ -915,7 +933,8 @@ fn main() {
 
         // TODO(aalhendi): fallible
         let window_handle = CreateWindowExA(
-            WS_EX_TOPMOST | WS_EX_LAYERED,
+            0,
+            // WS_EX_TOPMOST | WS_EX_LAYERED,
             wc.lpszClassName,
             s!("Handmade Hero"),
             WS_OVERLAPPEDWINDOW | WS_VISIBLE,
@@ -929,9 +948,25 @@ fn main() {
             ptr::null(),
         );
 
+        // TODO(aalhendi): GetSystemMetrics(SM_SAMPLERATE)? How do we reliably query refresh rate? GetComposition?
+        let monitor_refresh_hz = {
+            let refresh_dc = GetDC(window_handle);
+            let windows_refresh_rate = GetDeviceCaps(refresh_dc, VREFRESH as i32);
+            ReleaseDC(window_handle, refresh_dc);
+            // A vertical refresh rate value of 0 or 1 represents the display hardware's default refresh rate.
+            if windows_refresh_rate > 1 {
+                windows_refresh_rate
+            } else {
+                60_i32
+            }
+        };
+
+        let game_update_hz = monitor_refresh_hz as f32 / 2_f32;
+        let target_seconds_per_frame = 1_f64 / game_update_hz as f64;
+
         // NOTE(aalhendi): Audio test
         // TODO(aalhendi): make this sixty seconds?
-        let mut sound_output = Win32SoundOutput::new(48000);
+        let mut sound_output = Win32SoundOutput::new(48000, game_update_hz as u32);
 
         // can't load direct sound till we have a window handle
         let (_ds, _primary_buffer, secondary_buffer) =
@@ -1011,6 +1046,53 @@ fn main() {
             debug_platform_free_file_memory,
         };
 
+        for replay_idx in 0..state.replay_buffers.len() {
+            // TODO(aalhendi): Recording system still seems to take too long on record start
+            //  find out what Windows is doing and if we can speed up or defer some of that processing.
+
+            let mut fname = [0_u8; MAX_PATH_USIZE];
+            state.win32_get_input_file_location(false, replay_idx as u32, &mut fname);
+
+            let file_handle = CreateFileA(
+                fname.as_ptr(),
+                GENERIC_WRITE | GENERIC_READ,
+                0,
+                ptr::null(),
+                CREATE_ALWAYS, // TODO(aalhendi): this might be cause of latency. see FSCTL_SET_SPARSE?
+                0,
+                0 as HANDLE,
+            );
+
+            if file_handle == INVALID_HANDLE_VALUE {
+                panic!("Win32: Failed to create replay file.");
+            }
+
+            let mapping_handle = CreateFileMappingA(
+                file_handle,
+                ptr::null(),
+                PAGE_READWRITE,
+                (state.total_size >> 32) as u32,
+                (state.total_size & 0xFFFFFFFF) as u32,
+                ptr::null(),
+            );
+
+            if mapping_handle.is_null() {
+                panic!("Win32: Failed to create file mapping.");
+            }
+
+            let view = MapViewOfFile(mapping_handle, FILE_MAP_ALL_ACCESS, 0, 0, state.total_size);
+
+            if view.Value.is_null() {
+                panic!("Win32: Failed to map view of file.");
+            }
+
+            let replay_buffer = &mut state.replay_buffers[replay_idx];
+            replay_buffer.memory_block = view.Value as *mut ();
+            replay_buffer.file_handle = file_handle;
+            replay_buffer.memory_map = mapping_handle;
+            replay_buffer.file_name = fname;
+        }
+
         if samples.is_null()
             || game_memory.permanent_storage.is_null()
             || game_memory.transient_storage.is_null()
@@ -1031,7 +1113,7 @@ fn main() {
         #[cfg(feature = "internal_build")]
         let mut debug_time_marker_idx = 0;
         #[cfg(feature = "internal_build")]
-        let mut debug_time_markers = [Win32DebugTimeMarker::default(); GAME_UPDATE_HZ as usize / 2];
+        let mut debug_time_markers = [Win32DebugTimeMarker::default(); 30];
 
         #[cfg(feature = "internal_build")]
         let mut audio_latency_bytes;
@@ -1064,6 +1146,38 @@ fn main() {
             win32_process_pending_messages(&mut state, new_keyboard_controller);
 
             if !GLOBAL_PAUSE {
+                let mut mouse_pos = POINT::default();
+
+                GetCursorPos(&mut mouse_pos);
+                ScreenToClient(window_handle, &mut mouse_pos);
+
+                new_input.mouse_x = mouse_pos.x;
+                new_input.mouse_y = mouse_pos.y;
+                new_input.mouse_z = 0; // TODO(aalhendi): support scrollwheel?
+
+                // NOTE(aalhendi): If the high-order bit is 1, the key is down; otherwise, it is up.
+                // Since its an i16, the high order bit is the sign bit, so no need to check with & (1 << 15)
+                win32_process_keyboard_message(
+                    &mut new_input.mouse_buttons[0],
+                    GetKeyState(VK_LBUTTON as i32) < 0,
+                );
+                win32_process_keyboard_message(
+                    &mut new_input.mouse_buttons[1],
+                    GetKeyState(VK_MBUTTON as i32).is_negative(),
+                );
+                win32_process_keyboard_message(
+                    &mut new_input.mouse_buttons[2],
+                    GetKeyState(VK_RBUTTON as i32).is_negative(),
+                );
+                win32_process_keyboard_message(
+                    &mut new_input.mouse_buttons[3],
+                    GetKeyState(VK_XBUTTON1 as i32).is_negative(),
+                );
+                win32_process_keyboard_message(
+                    &mut new_input.mouse_buttons[4],
+                    GetKeyState(VK_XBUTTON2 as i32).is_negative(),
+                );
+
                 // TODO(aalhendi): should we poll this more frequently?
                 // TODO(aalhendi): need to not poll disconnected controllers to avoid xinput frame hit on older libraries
                 let mut max_controller_count = XUSER_MAX_COUNT as usize;
@@ -1224,6 +1338,8 @@ fn main() {
                 };
                 XInputSetState(0, &vibration);
 
+                let mut thread_ctx = ThreadContext::default();
+
                 let mut buffer = GameOffscreenBuffer {
                     width: GLOBAL_BACKBUFFER.width,
                     height: GLOBAL_BACKBUFFER.height,
@@ -1232,14 +1348,14 @@ fn main() {
                     memory: GLOBAL_BACKBUFFER.memory,
                 };
                 if state.input_recording_idx == 1 {
-                    win32_record_input(&mut state, new_input);
+                    state.win32_record_input(new_input);
                 }
                 if state.input_playing_idx == 1 {
-                    win32_playback_input(&mut state, new_input);
+                    state.win32_playback_input(new_input);
                 }
 
                 if let Some(update_and_render) = game.update_and_render {
-                    update_and_render(&mut game_memory, new_input, &mut buffer);
+                    update_and_render(&mut thread_ctx, &mut game_memory, new_input, &mut buffer);
                 }
 
                 /*
@@ -1281,13 +1397,13 @@ fn main() {
                         .0
                         % sound_output.buffer_size;
 
-                    let expected_sound_bytes_per_frame = (sound_output.samples_per_second
-                        * sound_output.bytes_per_sample)
-                        / GAME_UPDATE_HZ as u32;
+                    let expected_sound_bytes_per_frame =
+                        ((sound_output.samples_per_second * sound_output.bytes_per_sample) as f32
+                            / game_update_hz) as u32;
                     let seconds_left_until_flip =
-                        TARGET_SECONDS_PER_FRAME - from_begin_to_audio_seconds;
+                        target_seconds_per_frame - from_begin_to_audio_seconds;
                     let expected_bytes_until_flip =
-                        ((seconds_left_until_flip / TARGET_SECONDS_PER_FRAME)
+                        ((seconds_left_until_flip / target_seconds_per_frame)
                             * expected_sound_bytes_per_frame as f64) as u32;
                     let expected_frame_boundary_byte = play_cursor + expected_bytes_until_flip;
                     let safe_write_cursor = if write_cursor < play_cursor {
@@ -1349,7 +1465,7 @@ fn main() {
                     };
 
                     if let Some(get_sound_samples) = game.get_sound_samples {
-                        get_sound_samples(&mut game_memory, &mut sound_buffer);
+                        get_sound_samples(&mut thread_ctx, &mut game_memory, &mut sound_buffer);
                     }
 
                     // NOTE(aalhendi): ideally, we want to only fill sound buffer if there's something to write.
@@ -1373,11 +1489,11 @@ fn main() {
                 let work_seconds_elapsed = win32_get_seconds_elapsed(last_counter, work_counter);
 
                 let mut seconds_elapsed_for_frame = work_seconds_elapsed;
-                if seconds_elapsed_for_frame < TARGET_SECONDS_PER_FRAME {
-                    while seconds_elapsed_for_frame < TARGET_SECONDS_PER_FRAME {
+                if seconds_elapsed_for_frame < target_seconds_per_frame {
+                    while seconds_elapsed_for_frame < target_seconds_per_frame {
                         if sleep_is_granular {
                             let sleep_ms =
-                                (TARGET_SECONDS_PER_FRAME - seconds_elapsed_for_frame) * 1000_f64;
+                                (target_seconds_per_frame - seconds_elapsed_for_frame) * 1000_f64;
                             if sleep_ms > 1_f64 {
                                 // TODO(aalhendi): sleeping is hard... see Intel's TPAUSE instruction. I think AMD uses UMWAIT.
                                 windows_sys::Win32::System::Threading::Sleep(sleep_ms as u32);
@@ -1391,8 +1507,8 @@ fn main() {
                             const FRAME_TIME_SLOP_S: f64 = 0.002;
                             debug_assert!(
                                 test_seconds_elapsed_for_frame
-                                    < TARGET_SECONDS_PER_FRAME + FRAME_TIME_SLOP_S,
-                                "Test seconds elapsed for frame is greater than target seconds per frame {test_seconds_elapsed_for_frame} > {TARGET_SECONDS_PER_FRAME}"
+                                    < target_seconds_per_frame + FRAME_TIME_SLOP_S,
+                                "Test seconds elapsed for frame is greater than target seconds per frame {test_seconds_elapsed_for_frame} > {target_seconds_per_frame}"
                             );
                         }
 
@@ -1402,7 +1518,7 @@ fn main() {
                 } else {
                     // TODO(aalhendi): handle missed frame
                     println!(
-                        "MISSED TARGET FPS!!! {seconds_elapsed_for_frame} < {TARGET_SECONDS_PER_FRAME}"
+                        "MISSED TARGET FPS!!! {seconds_elapsed_for_frame} < {target_seconds_per_frame}"
                     );
                 }
 
@@ -1420,7 +1536,7 @@ fn main() {
                         debug_time_marker_idx - 1
                     },
                     &mut sound_output,
-                    TARGET_SECONDS_PER_FRAME,
+                    target_seconds_per_frame,
                 );
 
                 let device_context = GetDC(window_handle);
@@ -1556,10 +1672,10 @@ unsafe fn win32_process_pending_messages(
                             {
                                 if is_down {
                                     if state.input_recording_idx == 0 {
-                                        win32_begin_recording_input(state, 1);
+                                        state.win32_begin_recording_input(1);
                                     } else {
-                                        win32_end_recording_input(state);
-                                        win32_begin_input_playback(state, 1);
+                                        state.win32_end_recording_input();
+                                        state.win32_begin_input_playback(1);
                                     }
                                 }
                             }
@@ -1605,8 +1721,8 @@ extern "system" fn win32_main_window_callback(
 
             WM_ACTIVATEAPP => {
                 println!("WM_ACTIVATE");
-                let b_alpha = if wparam == TRUE as usize { 255 } else { 64 };
-                SetLayeredWindowAttributes(window, rgb(0, 0, 0), b_alpha, LWA_ALPHA);
+                // let b_alpha = if wparam == TRUE as usize { 255 } else { 64 };
+                // SetLayeredWindowAttributes(window, rgb(0, 0, 0), b_alpha, LWA_ALPHA);
                 LRESULT::from(0_isize)
             }
             WM_PAINT => {
@@ -1629,7 +1745,10 @@ extern "system" fn win32_main_window_callback(
 #[cfg(feature = "internal_build")]
 /// # Safety
 /// TODO(aalhendi): idk. write this up
-pub unsafe extern "C" fn debug_platform_free_file_memory(ptr: *mut ffi::c_void) {
+pub unsafe extern "C" fn debug_platform_free_file_memory(
+    _thread: &mut ThreadContext,
+    ptr: *mut ffi::c_void,
+) {
     unsafe {
         if !ptr.is_null() {
             // TODO(aalhendi): hanlde the result
@@ -1642,6 +1761,7 @@ pub unsafe extern "C" fn debug_platform_free_file_memory(ptr: *mut ffi::c_void) 
 
 #[cfg(feature = "internal_build")]
 pub extern "C" fn debug_platform_write_entire_file(
+    _thread: &mut ThreadContext,
     filename: *const ffi::c_char,
     memory_size: u32,
     memory: *mut ffi::c_void,
@@ -1693,6 +1813,7 @@ pub extern "C" fn debug_platform_write_entire_file(
 
 #[cfg(feature = "internal_build")]
 pub extern "C" fn debug_platform_read_entire_file(
+    thread: &mut ThreadContext,
     filename: *const ffi::c_char,
 ) -> DebugPlatformReadFileResult {
     unsafe {
@@ -1749,7 +1870,7 @@ pub extern "C" fn debug_platform_read_entire_file(
         );
         // TODO(aalhendi): check result
         if read_result == FALSE || bytes_read != file_size_u32 {
-            debug_platform_free_file_memory(memory_ptr);
+            debug_platform_free_file_memory(thread, memory_ptr);
             eprintln!("Failed to read file: {read_result:?}");
             // sound because we just freed the memory
             memory_ptr = ptr::null_mut();
