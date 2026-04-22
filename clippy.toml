@@ -1,0 +1,5 @@
+disallowed-methods = [
+    # want a pure arena environment (no dyn alloc)
+    "std::vec::Vec::new",
+    "std::boxed::Box::new",
+]

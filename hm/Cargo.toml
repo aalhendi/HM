@@ -1,0 +1,13 @@
+[package]
+name = "hm_app"
+version.workspace = true
+edition.workspace = true
+
+[target.'cfg(target_os = "windows")'.dependencies]
+win32_platform = { path = "../win32_platform" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+linux_platform = { path = "../linux_platform" }
+
+[lints]
+workspace = true

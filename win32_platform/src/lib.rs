@@ -1,5 +1,8 @@
 #![allow(static_mut_refs)]
 
+#[cfg(not(target_os = "windows"))]
+compile_error!("win32_platform can only be built on Windows.");
+
 use core::{arch::x86_64, ffi, mem, ptr};
 use interface::{
     GameButton, GameButtonState, GameControllerInput, GameInput, GameMemory, GameOffscreenBuffer,
@@ -887,7 +890,7 @@ impl Win32OffscreenBuffer {
     }
 }
 
-fn main() {
+pub fn run() {
     unsafe {
         // TODO(aalhendi): fallible
         let module_handle = GetModuleHandleA(ptr::null());
@@ -1671,11 +1674,15 @@ unsafe fn win32_process_pending_messages(
                             #[cfg(feature = "internal_build")]
                             {
                                 if is_down {
-                                    if state.input_recording_idx == 0 {
-                                        state.win32_begin_recording_input(1);
+                                    if state.input_playing_idx == 0 {
+                                        if state.input_recording_idx == 0 {
+                                            state.win32_begin_recording_input(1);
+                                        } else {
+                                            state.win32_end_recording_input();
+                                            state.win32_begin_input_playback(1);
+                                        }
                                     } else {
-                                        state.win32_end_recording_input();
-                                        state.win32_begin_input_playback(1);
+                                        state.win32_end_input_playback();
                                     }
                                 }
                             }

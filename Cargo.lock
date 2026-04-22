@@ -10,8 +10,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "hm_app"
+version = "0.1.0"
+dependencies = [
+ "linux_platform",
+ "win32_platform",
+]
+
+[[package]]
 name = "interface"
 version = "0.1.0"
+
+[[package]]
+name = "linux_platform"
+version = "0.1.0"
+dependencies = [
+ "interface",
+]
 
 [[package]]
 name = "win32_platform"

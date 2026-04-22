@@ -2,13 +2,26 @@
 resolver = "2"
 
 members = [
+    "hm",
     "interface",
     "win32_platform",
+    "linux_platform",
+    "game",
+]
+
+default-members = [
+    "hm",
     "game",
 ]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.94.1"
+rust-version = "1.95.0"
 authors = ["aalhendi"]
+
+[workspace.lints.clippy]
+disallowed_methods = "deny"
+
+[profile.release]
+panic = "abort"

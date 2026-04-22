@@ -30,3 +30,6 @@ features = [
 internal_build = ["interface/internal_build"]
 
 default = ["internal_build"]
+
+[lints]
+workspace = true
