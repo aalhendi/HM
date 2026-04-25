@@ -172,7 +172,7 @@ pub struct GameInput {
     pub mouse_y: i32,
     pub mouse_z: i32,
 
-    // TODO(aalhendi): insert clock values here.
+    pub seconds_to_advance_over_update: f64,
     pub controllers: [GameControllerInput; 5], // 4 controllers + 1 keyboard
 }
 

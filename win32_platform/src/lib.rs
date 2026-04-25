@@ -913,7 +913,7 @@ pub fn run() {
             println!("Sleep is not granular. This is bad.");
         }
 
-        GLOBAL_BACKBUFFER.win32_resize_dib_section(1280, 720);
+        GLOBAL_BACKBUFFER.win32_resize_dib_section(960, 540);
 
         // TODO(aalhendi): getmodulehandlea check result fallible
         let instance = HINSTANCE::from(GetModuleHandleA(ptr::null()));
@@ -1109,6 +1109,7 @@ pub fn run() {
 
         let mut new_input = &mut new_input_slice[0];
         let mut old_input = &mut old_input_slice[0];
+        new_input.seconds_to_advance_over_update = target_seconds_per_frame;
 
         let mut last_counter = win32_get_wall_clock();
         let mut flip_wall_clock = win32_get_wall_clock();

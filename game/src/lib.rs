@@ -3,25 +3,11 @@
 // NOTE(aalhendi): Services that the game provides to the platform layer
 
 use core::f32;
-#[cfg(feature = "internal_build")]
-use core::{ffi, slice};
-use interface::{
-    GameButton, GameInput, GameMemory, GameOffscreenBuffer, GameSoundOutputBuffer, ThreadContext,
-};
+use interface::{GameInput, GameMemory, GameOffscreenBuffer, GameSoundOutputBuffer, ThreadContext};
 
 #[derive(Default)]
 #[repr(C)]
-pub struct GameState {
-    pub tone_hz: u32,
-    pub blue_offset: i32,
-    pub green_offset: i32,
-
-    pub t_sine: f32,
-
-    pub player_x: i32,
-    pub player_y: i32,
-    pub t_jump: f32,
-}
+pub struct GameState {}
 
 fn game_output_sound(
     _thread: &mut ThreadContext,
@@ -35,8 +21,9 @@ fn game_output_sound(
     unsafe {
         let mut sample_out = buffer.samples;
         for _sample_index in 0..buffer.sample_count {
-            let sine_value = f32::sin(game_state.t_sine);
-            let sample_value = (sine_value * tone_volume as f32) as i16;
+            // let sine_value = f32::sin(game_state.t_sine);
+            // let sample_value = (sine_value * tone_volume as f32) as i16;
+            let sample_value = 0;
 
             // basically, we write L/R L/R L/R L/R etc.
             // we use sample_out as an i16 ptr to the memory location we want to write to (region1 / ringbuffer)
@@ -44,11 +31,11 @@ fn game_output_sound(
             sample_out = sample_out.offset(1);
             *sample_out = sample_value;
             sample_out = sample_out.offset(1);
-            // move 1 sample worth forward
-            game_state.t_sine += 2_f32 * f32::consts::PI * 1_f32 / wave_period as f32;
-            if game_state.t_sine > 2_f32 * f32::consts::PI {
-                game_state.t_sine -= 2_f32 * f32::consts::PI;
-            }
+            // // move 1 sample worth forward
+            // game_state.t_sine += 2_f32 * f32::consts::PI * 1_f32 / wave_period as f32;
+            // if game_state.t_sine > 2_f32 * f32::consts::PI {
+            //     game_state.t_sine -= 2_f32 * f32::consts::PI;
+            // }
         }
     }
 }
@@ -68,37 +55,6 @@ pub extern "C" fn game_update_and_render(
     let game_state = unsafe { &mut *memory.permanent_storage.cast::<GameState>() };
 
     if !memory.is_initialized {
-        #[cfg(feature = "internal_build")]
-        {
-            let filename = c"game/src/lib.rs".as_ptr();
-            let read_result = unsafe { (memory.debug_platform_read_entire_file)(thread, filename) };
-
-            let file_memory = unsafe {
-                slice::from_raw_parts_mut(read_result.memory as *mut u8, read_result.size as usize)
-            };
-
-            unsafe {
-                (memory.debug_platform_write_entire_file)(
-                    thread,
-                    c"test.out".as_ptr(),
-                    file_memory.len() as u32,
-                    file_memory.as_mut_ptr().cast::<ffi::c_void>(),
-                );
-
-                (memory.debug_platform_free_file_memory)(thread, read_result.memory);
-            }
-        }
-
-        game_state.tone_hz = 512;
-        game_state.t_sine = 0_f32;
-
-        game_state.player_x = 100;
-        game_state.player_y = 100;
-
-        // NOTE(aalhendi): these are not needed because they are cleared to 0 at startup by requirement!
-        // game_state.blue_offset = 0;
-        // game_state.green_offset = 0;
-
         // TODO(aalhendi): this may be more appropriate in to do in the platform layer
         memory.is_initialized = true;
     }
@@ -106,43 +62,12 @@ pub extern "C" fn game_update_and_render(
     for controller in input.controllers.iter_mut() {
         if controller.is_analog {
             // NOTE(aalhendi): use analog tuning
-            game_state.blue_offset += (4.0_f32 * controller.left_stick_average_x) as i32;
-            game_state.tone_hz = 512 + (128_f32 * controller.left_stick_average_y) as u32;
         } else {
             // NOTE(aalhendi): use digital tuning
-            if controller.button(GameButton::MoveLeft).ended_down {
-                game_state.blue_offset -= 1;
-            }
-            if controller.button(GameButton::MoveRight).ended_down {
-                game_state.blue_offset += 1;
-            }
-        }
-
-        if controller.button(GameButton::ActionDown).ended_down {
-            game_state.green_offset += 1;
-        }
-        game_state.player_x += (4.0_f32 * controller.left_stick_average_x) as i32;
-        game_state.player_y -= (4.0_f32 * controller.left_stick_average_y) as i32;
-
-        if game_state.t_jump > 0.0 {
-            game_state.player_y +=
-                (5_f32 * f32::sin(0.5 * f32::consts::PI * game_state.t_jump)) as i32
-        }
-        if controller.button(GameButton::ActionDown).ended_down {
-            game_state.t_jump = 4.0;
-        }
-        game_state.t_jump -= 0.033;
-    }
-
-    render_weird_gradient(buffer, game_state.blue_offset, game_state.green_offset);
-    render_player(buffer, game_state.player_x, game_state.player_y);
-
-    render_player(buffer, input.mouse_x, input.mouse_y);
-    for (button_idx, button) in input.mouse_buttons.iter().enumerate() {
-        if button.ended_down {
-            render_player(buffer, 10 + 20 * button_idx as i32, 10);
         }
     }
+
+    draw_rectangle(buffer, 10.0, 10.0, 30.0, 30.0);
 }
 
 // NOTE(aalhendi): At the moment, this has to be a very fast function, it cannot be more than a millisecond
@@ -155,60 +80,51 @@ pub extern "C" fn game_get_sound_samples(
     sound_buffer: &mut GameSoundOutputBuffer,
 ) {
     let game_state = unsafe { &mut *memory.permanent_storage.cast::<GameState>() };
-    game_output_sound(thread, game_state, sound_buffer, game_state.tone_hz);
+    game_output_sound(thread, game_state, sound_buffer, 400);
 }
 
-fn render_weird_gradient(buffer: &mut GameOffscreenBuffer, blue_offset: i32, green_offset: i32) {
-    let width = buffer.width;
-    let height = buffer.height;
+fn draw_rectangle(
+    buffer: &mut GameOffscreenBuffer,
+    min_x: f32,
+    min_y: f32,
+    max_x: f32,
+    max_y: f32,
+) {
+    let mut int_min_x = min_x.round() as i32;
+    let mut int_min_y = min_y.round() as i32;
+    let mut int_max_x = max_x.round() as i32;
+    let mut int_max_y = max_y.round() as i32;
 
-    let mut row = buffer.memory as *const u8;
-    for y in 0..height {
-        let mut pixel = row as *mut i32;
-        for x in 0..width {
-            /*
-            Padding is not put first even if its Little Endian because... Windows.
-            Memory (u32): BB GG RR XX
-            Register: XX RR GG BB where XX is padding 0
-            */
-            let blue = x.wrapping_add(blue_offset);
-            let green = y.wrapping_add(green_offset);
-
-            unsafe {
-                *pixel = (green << 8) | blue;
-                pixel = pixel.offset(1);
-            }
-        }
-        row = unsafe { row.offset(buffer.pitch as isize) };
+    // clipping rules
+    if int_min_x < 0 {
+        int_min_x = 0;
     }
-}
+    if int_min_y < 0 {
+        int_min_y = 0;
+    }
+    if int_max_x >= buffer.width {
+        int_max_x = buffer.width;
+    }
+    if int_max_y >= buffer.height {
+        int_max_y = buffer.height;
+    }
 
-fn render_player(buffer: &mut GameOffscreenBuffer, player_x: i32, player_y: i32) {
-    let end_of_buffer = unsafe {
+    let color = 0xFFFFFFFF;
+    let mut row = unsafe {
         buffer
             .memory
             .cast::<u8>()
-            .add((buffer.pitch * buffer.height) as usize)
+            .add((int_min_x * buffer.bytes_per_pixel) as usize)
+            .offset((int_min_y * buffer.pitch) as isize)
     };
-    let color = 0xFFFFFFFF;
-    let top = player_y;
-    let bottom = player_y + 10;
-
-    for x in player_x..player_x + 10 {
-        let mut pixel = unsafe {
-            buffer
-                .memory
-                .cast::<u8>()
-                .add((x * buffer.bytes_per_pixel) as usize)
-                .offset((top * buffer.pitch) as isize)
-        };
-        for _y in top..bottom {
+    for y in int_min_y..int_max_y {
+        let mut pixel = row.cast::<u32>();
+        for _x in int_min_x..int_max_x {
             unsafe {
-                if pixel >= buffer.memory.cast::<u8>() && pixel < end_of_buffer {
-                    *(pixel as *mut u32) = color;
-                    pixel = pixel.add(buffer.pitch as usize);
-                }
+                *pixel = color;
+                pixel = pixel.add(1);
             };
         }
+        row = unsafe { row.add(buffer.pitch as usize) };
     }
 }
