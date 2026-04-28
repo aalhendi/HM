@@ -3,11 +3,15 @@
 // NOTE(aalhendi): Services that the game provides to the platform layer
 
 use core::f32;
+use interface::GameButton::{MoveDown, MoveLeft, MoveRight, MoveUp};
 use interface::{GameInput, GameMemory, GameOffscreenBuffer, GameSoundOutputBuffer, ThreadContext};
 
 #[derive(Default)]
 #[repr(C)]
-pub struct GameState {}
+pub struct GameState {
+    player_x: f32,
+    player_y: f32,
+}
 
 fn game_output_sound(
     _thread: &mut ThreadContext,
@@ -64,10 +68,88 @@ pub extern "C" fn game_update_and_render(
             // NOTE(aalhendi): use analog tuning
         } else {
             // NOTE(aalhendi): use digital tuning
+            let mut d_player_x = 0.0; // pixels/s
+            let mut d_player_y = 0.0; // pixels/s
+            if controller.button(MoveUp).ended_down {
+                d_player_y = -1.0;
+            }
+            if controller.button(MoveDown).ended_down {
+                d_player_y = 1.0;
+            }
+            if controller.button(MoveLeft).ended_down {
+                d_player_x = -1.0;
+            }
+            if controller.button(MoveRight).ended_down {
+                d_player_x = 1.0;
+            }
+
+            d_player_x *= 64.0;
+            d_player_y *= 64.0;
+
+            // TODO(aalhendi): diagonal will be faster! fis once we have vectors
+            game_state.player_x += input.dt_for_frame as f32 * d_player_x;
+            game_state.player_y += input.dt_for_frame as f32 * d_player_y;
         }
     }
 
-    draw_rectangle(buffer, 10.0, 10.0, 30.0, 30.0);
+    let tilemap: [[u32; 16]; 9] = [
+        [0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0],
+        [0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0],
+        [0, 1, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0],
+        [0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0],
+        [0, 1, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0],
+        [0, 1, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0],
+        [0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0],
+        [0, 1, 1, 1, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0],
+        [0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0],
+    ];
+
+    draw_rectangle(
+        buffer,
+        0.0,
+        0.0,
+        buffer.width as f32,
+        buffer.height as f32,
+        1.0,
+        0.0,
+        1.0,
+    );
+
+    let tile_width = 60_f32;
+    let tile_height = 60_f32;
+
+    for row in 0..9 {
+        for column in 0..16 {
+            let color = if tilemap[row][column] == 1 {
+                (1.0, 1.0, 1.0)
+            } else {
+                (0.5, 0.5, 0.5)
+            };
+            let min_x = column as f32 * tile_width;
+            let min_y = row as f32 * tile_height;
+            let max_x = min_x + tile_width;
+            let max_y = min_y + tile_height;
+            draw_rectangle(
+                buffer, min_x, min_y, max_x, max_y, color.0, color.1, color.2,
+            );
+        }
+    }
+
+    let player_rgb = (1.0, 1.0, 0.0);
+    let player_width = 0.75 * tile_width;
+    let player_height = 0.75 * tile_height;
+    let player_left = game_state.player_x - player_width / 2.0;
+    let player_top = game_state.player_y - player_height;
+    draw_rectangle(
+        buffer,
+        player_left,
+        player_top,
+        player_left + player_width,
+        player_top + player_height,
+        player_rgb.0,
+        player_rgb.1,
+        player_rgb.2,
+    );
 }
 
 // NOTE(aalhendi): At the moment, this has to be a very fast function, it cannot be more than a millisecond
@@ -85,41 +167,37 @@ pub extern "C" fn game_get_sound_samples(
 
 fn draw_rectangle(
     buffer: &mut GameOffscreenBuffer,
-    min_x: f32,
-    min_y: f32,
-    max_x: f32,
-    max_y: f32,
+    f_min_x: f32,
+    f_min_y: f32,
+    f_max_x: f32,
+    f_max_y: f32,
+    r: f32,
+    g: f32,
+    b: f32,
 ) {
-    let mut int_min_x = min_x.round() as i32;
-    let mut int_min_y = min_y.round() as i32;
-    let mut int_max_x = max_x.round() as i32;
-    let mut int_max_y = max_y.round() as i32;
+    let min_x = (f_min_x.round() as i32).clamp(0, buffer.width);
+    let min_y = (f_min_y.round() as i32).clamp(0, buffer.height);
+    let max_x = (f_max_x.round() as i32).clamp(0, buffer.width);
+    let max_y = (f_max_y.round() as i32).clamp(0, buffer.height);
 
-    // clipping rules
-    if int_min_x < 0 {
-        int_min_x = 0;
-    }
-    if int_min_y < 0 {
-        int_min_y = 0;
-    }
-    if int_max_x >= buffer.width {
-        int_max_x = buffer.width;
-    }
-    if int_max_y >= buffer.height {
-        int_max_y = buffer.height;
+    if min_x >= max_x || min_y >= max_y {
+        return;
     }
 
-    let color = 0xFFFFFFFF;
+    let color = ((r * 255.0).round() as u32) << 16
+        | ((g * 255.0).round() as u32) << 8
+        | ((b * 255.0).round() as u32);
+
     let mut row = unsafe {
         buffer
             .memory
             .cast::<u8>()
-            .add((int_min_x * buffer.bytes_per_pixel) as usize)
-            .offset((int_min_y * buffer.pitch) as isize)
+            .add((min_x * buffer.bytes_per_pixel) as usize)
+            .offset((min_y * buffer.pitch) as isize)
     };
-    for y in int_min_y..int_max_y {
+    for _y in min_y..max_y {
         let mut pixel = row.cast::<u32>();
-        for _x in int_min_x..int_max_x {
+        for _x in min_x..max_x {
             unsafe {
                 *pixel = color;
                 pixel = pixel.add(1);

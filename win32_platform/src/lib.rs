@@ -1097,7 +1097,6 @@ pub fn run() {
 
         let mut new_input = &mut new_input_slice[0];
         let mut old_input = &mut old_input_slice[0];
-        new_input.seconds_to_advance_over_update = target_seconds_per_frame;
 
         let mut last_counter = win32_get_wall_clock();
         let mut flip_wall_clock = win32_get_wall_clock();
@@ -1119,6 +1118,8 @@ pub fn run() {
         let mut last_cycle_count = x86_64::_rdtsc();
 
         while GLOBAL_RUNNING {
+            new_input.dt_for_frame = target_seconds_per_frame;
+
             let new_dll_write_time = win32_get_last_write_time(source_dll_name.as_ptr());
             if CompareFileTime(&new_dll_write_time, &game.last_write_time) != 0 {
                 win32_unload_game_code(&mut game);
@@ -1172,14 +1173,13 @@ pub fn run() {
 
                 // TODO(aalhendi): should we poll this more frequently?
                 // TODO(aalhendi): need to not poll disconnected controllers to avoid xinput frame hit on older libraries
-                let mut max_controller_count = XUSER_MAX_COUNT as usize;
-                if max_controller_count > new_input.controllers.len() {
-                    max_controller_count = new_input.controllers.len();
-                }
-                // NOTE(aalhendi): max controller count minus the keyboard controller
-                for controller_index in 0..max_controller_count - 1 {
-                    let old_controller = &mut old_input.controllers[controller_index];
-                    let new_controller = &mut new_input.controllers[controller_index];
+                let max_controller_count =
+                    (XUSER_MAX_COUNT as usize).min(new_input.controllers.len() - 1);
+                for controller_index in 0..max_controller_count {
+                    // NOTE(aalhendi): controllers[0] is the keyboard; XInput pads are stored after it.
+                    let controller_storage_index = controller_index + 1;
+                    let old_controller = &mut old_input.controllers[controller_storage_index];
+                    let new_controller = &mut new_input.controllers[controller_storage_index];
 
                     let mut controller_state: XINPUT_STATE = XINPUT_STATE::default();
                     let x_input_state_res =
@@ -1519,17 +1519,17 @@ pub fn run() {
                 last_counter = end_counter;
 
                 let dims = Win32WindowDimension::from(window_handle);
-                #[cfg(feature = "internal_build")]
-                GLOBAL_BACKBUFFER.debug_sync_display(
-                    &mut debug_time_markers,
-                    if debug_time_marker_idx == 0 {
-                        debug_time_marker_idx
-                    } else {
-                        debug_time_marker_idx - 1
-                    },
-                    &mut sound_output,
-                    target_seconds_per_frame,
-                );
+                // #[cfg(feature = "internal_build")]
+                // GLOBAL_BACKBUFFER.debug_sync_display(
+                //     &mut debug_time_markers,
+                //     if debug_time_marker_idx == 0 {
+                //         debug_time_marker_idx
+                //     } else {
+                //         debug_time_marker_idx - 1
+                //     },
+                //     &mut sound_output,
+                //     target_seconds_per_frame,
+                // );
 
                 let device_context = GetDC(window_handle);
                 GLOBAL_BACKBUFFER.win32_copy_buffer_to_window(

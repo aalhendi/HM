@@ -185,7 +185,7 @@ pub struct GameInput {
     pub mouse_y: i32,
     pub mouse_z: i32,
 
-    pub seconds_to_advance_over_update: f64,
+    pub dt_for_frame: f64,
     pub controllers: [GameControllerInput; 5], // 4 controllers + 1 keyboard
 }
 
