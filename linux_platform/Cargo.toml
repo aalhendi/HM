@@ -6,6 +6,9 @@ edition.workspace = true
 [dependencies]
 interface = { path = "../interface", default-features = false }
 
+winit = "0.30.13"
+softbuffer = "0.4.8"
+
 [features]
 internal_build = ["interface/internal_build"]
 

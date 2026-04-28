@@ -5,8 +5,9 @@ compile_error!("win32_platform can only be built on Windows.");
 
 use core::{arch::x86_64, ffi, mem, ptr};
 use interface::{
-    GameButton, GameButtonState, GameControllerInput, GameInput, GameMemory, GameOffscreenBuffer,
-    GameSoundOutputBuffer, ThreadContext, gigabytes_to_bytes, megabytes_to_bytes,
+    GameButton, GameButtonState, GameControllerInput, GameGetSoundSamplesFn, GameInput, GameMemory,
+    GameOffscreenBuffer, GameSoundOutputBuffer, GameUpdateAndRenderFn, ThreadContext,
+    gigabytes_to_bytes, megabytes_to_bytes,
 };
 
 #[cfg(feature = "internal_build")]
@@ -101,19 +102,6 @@ static mut GLOBAL_BACKBUFFER: Win32OffscreenBuffer = Win32OffscreenBuffer {
 };
 
 static mut PERF_COUNT_FREQUENCY: i64 = 0;
-
-pub type GameUpdateAndRenderFn = unsafe extern "C" fn(
-    thread: &mut ThreadContext,
-    memory: &mut GameMemory,
-    input: &mut GameInput,
-    buffer: &mut GameOffscreenBuffer,
-);
-
-pub type GameGetSoundSamplesFn = unsafe extern "C" fn(
-    thread: &mut ThreadContext,
-    memory: &mut GameMemory,
-    sound_buffer: &mut GameSoundOutputBuffer,
-);
 
 // /// A helper function to create a COLORREF from RGB values. `windows-sys` doesn't have the equivalent of the C macro `RGB`.
 // #[inline(always)]

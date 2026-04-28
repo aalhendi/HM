@@ -83,6 +83,19 @@ impl Default for GameMemory {
     }
 }
 
+pub type GameUpdateAndRenderFn = unsafe extern "C" fn(
+    thread: &mut ThreadContext,
+    memory: &mut GameMemory,
+    input: &mut GameInput,
+    buffer: &mut GameOffscreenBuffer,
+);
+
+pub type GameGetSoundSamplesFn = unsafe extern "C" fn(
+    thread: &mut ThreadContext,
+    memory: &mut GameMemory,
+    sound_buffer: &mut GameSoundOutputBuffer,
+);
+
 #[cfg(feature = "internal_build")]
 #[repr(C)]
 pub struct DebugPlatformReadFileResult {
