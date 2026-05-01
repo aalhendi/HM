@@ -1,0 +1,8 @@
+void GameGetSoundSamples()
+{
+}
+
+void GameUpdateAndRender()
+{
+
+}
