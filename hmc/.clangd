@@ -1,0 +1,6 @@
+CompileFlags:
+  Add:
+    - -DDEBUG_PROFILE=1
+    - -DDEBUG_ASSERTIONS=1
+    - -DHANDMADE_WIN32=0
+    - -I./src

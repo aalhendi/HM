@@ -1,0 +1,8 @@
+---
+# We'll use LLVM as a base, but tweak it for modern monitors
+BasedOnStyle: LLVM
+IndentWidth: 4
+ColumnLimit: 120
+# This keeps the "internal" and "global_variable" macros from getting mangled
+MacroBlockBegin: "^[A-Z_]+_BEGIN$"
+MacroBlockEnd: "^[A-Z_]+_END$"

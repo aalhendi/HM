@@ -1,6 +1,6 @@
 @echo off
 
-set CommonCompilerFlags=-MTd -nologo -Gm- -GR- -EHa- -Od -Oi -WX -W4 -wd4201 -wd4100 -wd4189 -wd4505 -DHANDMADE_INTERNAL=1 -DHANDMADE_SLOW=1 -DHANDMADE_WIN32=0 -FC -Z7
+set CommonCompilerFlags=-MTd -nologo -Gm- -GR- -EHa- -Od -Oi -WX -W4 -wd4201 -wd4100 -wd4189 -wd4505 -DDEBUG_PROFILE=1 -DDEBUG_ASSERTIONS=1 -DHANDMADE_WIN32=0 -FC -Z7
 set CommonLinkerFlags= -incremental:no -opt:ref user32.lib gdi32.lib winmm.lib
 
 REM TODO - can we just build both with one exe?
@@ -13,6 +13,6 @@ REM REM cl %CommonCompilerFlags% ..\src\win32_handmade.c /link -subsystem:window
 
 REM REM 64-bit build
 del *.pdb > NUL 2> NUL
-cl %CommonCompilerFlags% ..\src\handmade.c -Fmhandmade.map -LD /link -incremental:no -opt:ref -PDB:handmade_%random%.pdb -EXPORT:GameGetSoundSamples -EXPORT:GameUpdateAndRender
+cl %CommonCompilerFlags% ..\src\handmade.c -Fmhandmade.map -LD /link -incremental:no -opt:ref -PDB:handmade_%random%.pdb -EXPORT:game_get_sound_samples -EXPORT:game_update_and_render
 cl %CommonCompilerFlags% ..\src\win32_handmade.c -Fmwin32_handmade.map /link %CommonLinkerFlags%
 popd
