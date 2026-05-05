@@ -87,7 +87,7 @@ typedef i32 bool32;
 #define ArrayCount(arr) (sizeof(arr) / sizeof((arr)[0]))
 // TODO(aalhendi): other array ops. swap, min, max macro/fn?
 
-inline u32 truncate_u64_to_u32_safe(u64 value) {
+internal inline u32 truncate_u64_to_u32_safe(u64 value) {
     // TODO(aalhendi): Defines for u64_MAX etc
     Assert(value <= 0xFFFFFFFF);
     u32 res = (u32)value;
@@ -189,7 +189,7 @@ typedef struct GameInput {
 
     GameControllerInput controllers[5];
 } GameInput;
-inline GameControllerInput *get_controller(GameInput *input, int unsigned controller_idx) {
+internal inline GameControllerInput *get_controller(GameInput *input, int unsigned controller_idx) {
     Assert(controller_idx < ArrayCount(input->controllers));
 
     GameControllerInput *result = &input->controllers[controller_idx];
